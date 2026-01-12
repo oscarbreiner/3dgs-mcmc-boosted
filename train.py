@@ -115,16 +115,38 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration == opt.iterations:
                 progress_bar.close()
 
+            # --- Custom Logging ---
+            if tb_writer:
+                opacities = gaussians.get_opacity
+                is_dead = (opacities <= 0.005).squeeze()
+                num_dead = is_dead.sum().item()
+                num_alive = opacities.shape[0] - num_dead
+
+                tb_writer.add_scalar('scene/num_dead_gaussians', num_dead, iteration)
+                tb_writer.add_scalar('scene/num_alive_gaussians', num_alive, iteration)
+                
+                # 3. Log Opacity Stats (Logging every single value is too heavy, we log stats + histogram)
+                tb_writer.add_scalar('scene/opacity_mean', opacities.mean().item(), iteration)
+                tb_writer.add_scalar('scene/opacity_min', opacities.min().item(), iteration)
+                tb_writer.add_scalar('scene/opacity_max', opacities.max().item(), iteration)
+                
+
             # Log and save
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
+            # --- Modified Densification Block ---
+            n_relocated_count = 0 
             if iteration < opt.densify_until_iter and iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                 dead_mask = (gaussians.get_opacity <= 0.005).squeeze(-1)
-                gaussians.relocate_gs(dead_mask=dead_mask)
+                n_relocated_count = gaussians.relocate_gs(dead_mask=dead_mask) 
                 gaussians.add_new_gs(cap_max=args.cap_max)
+
+            # Log relocated count (will be 0 for most iterations)
+            if tb_writer:
+                tb_writer.add_scalar('scene/num_relocated', n_relocated_count, iteration)
 
             # Optimizer step
             if iteration < opt.iterations:
@@ -200,7 +222,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
 
         if tb_writer:
-            tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
+            tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity.detach().cpu().numpy(), iteration)
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
 
@@ -232,7 +254,13 @@ if __name__ == "__main__":
         for key, value in config.items():
             setattr(args, key, value)
 
-    args.save_iterations.append(args.iterations)
+    # --- NEW: Force 1000-step intervals for saving and testing ---
+    # Generates [1000, 2000, 3000, ... iterations]
+    save_intervals = list(range(1000, args.iterations + 1, 1000))
+    args.save_iterations = save_intervals
+    args.test_iterations = save_intervals
+
+    # args.save_iterations.append(args.iterations)
     
     print("Optimizing " + args.model_path)
 

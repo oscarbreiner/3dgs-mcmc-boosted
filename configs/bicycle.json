@@ -1,4 +1,27 @@
 {
+    "init_type": "random", 
+    "source_path": "data/bicycle",
+    "model_path": "output/bicycle_random",
     "resolution": 4,
-    "cap_max": 5900000
+    "white_background": false,
+    "random_background": true,
+    "cap_max": 2000000,
+    "iterations": 30000,
+    "position_lr_init": 0.00016,
+    "position_lr_final": 0.0000016,
+    "position_lr_delay_mult": 0.01,
+    "position_lr_max_steps": 30000,
+    "feature_lr": 0.0025,
+    "opacity_lr": 0.05,
+    "scaling_lr": 0.001,
+    "rotation_lr": 0.001,
+    "lambda_dssim": 0.2,
+    "densification_interval": 100,
+    "opacity_reset_interval": 3000,
+    "densify_from_iter": 500,
+    "densify_until_iter": 15000,
+    "sh_degree": 3,
+    "scale_reg": 0.01,
+    "opacity_reg": 0.01,
+    "noise_lr": 500000
 }

@@ -54,6 +54,8 @@ class GaussianModel:
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
+        self.per_gaussian_error = torch.empty(0)
+        self._dummy_error_vars = torch.empty(0)  # Dummy variables e_k for Section 3.2
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
@@ -71,6 +73,7 @@ class GaussianModel:
             self.max_radii2D,
             self.xyz_gradient_accum,
             self.denom,
+            self.per_gaussian_error,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
         )
@@ -86,11 +89,13 @@ class GaussianModel:
         self.max_radii2D, 
         xyz_gradient_accum, 
         denom,
+        per_gaussian_error,
         opt_dict, 
         self.spatial_lr_scale) = model_args
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
+        self.per_gaussian_error = per_gaussian_error
         self.optimizer.load_state_dict(opt_dict)
 
     @property
@@ -114,6 +119,11 @@ class GaussianModel:
     @property
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
+    
+    @property
+    def get_dummy_error_vars(self):
+        """Get dummy variables e_k for per-Gaussian error computation (Section 3.2)."""
+        return self._dummy_error_vars
     
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
@@ -146,11 +156,19 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        
+        # Initialize dummy variables for per-Gaussian error (Section 3.2)
+        self._dummy_error_vars = torch.zeros((fused_point_cloud.shape[0]), device="cuda", requires_grad=True)
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.per_gaussian_error = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        
+        # Initialize dummy variables for Section 3.2 per-Gaussian error computation
+        # These are initialized to 0 and never updated by the optimizer
+        self._dummy_error_vars = torch.zeros((self.get_xyz.shape[0]), device="cuda", requires_grad=True)
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -470,16 +488,15 @@ class GaussianModel:
     
 
     def relocate_gs(self, dead_mask=None):
-
         if dead_mask.sum() == 0:
-            return
+            return 0    # <--- Added return value for logging
 
         alive_mask = ~dead_mask 
         dead_indices = dead_mask.nonzero(as_tuple=True)[0]
         alive_indices = alive_mask.nonzero(as_tuple=True)[0]
 
         if alive_indices.shape[0] <= 0:
-            return
+            return 0    # <--- Added return value for logging
 
         # sample from alive ones based on opacity
         probs = (self.get_opacity[alive_indices, 0]) 
@@ -498,6 +515,8 @@ class GaussianModel:
         self._scaling[reinit_idx] = self._scaling[dead_indices]
 
         self.replace_tensors_to_optimizer(inds=reinit_idx) 
+
+        return dead_indices.shape[0]    # <--- Added return value for logging
         
 
     def add_new_gs(self, cap_max):

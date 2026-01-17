@@ -93,6 +93,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
         image = render_pkg["render"]
+        if args.reloc_sampling in ("importance", "hybrid"):
+            max_id = render_pkg.get("max_id")
+            if max_id is not None:
+                with torch.no_grad():
+                    valid = max_id >= 0
+                    if valid.any():
+                        counts = torch.bincount(
+                            max_id[valid].view(-1),
+                            minlength=gaussians.get_xyz.shape[0]
+                        ).float()
+                    else:
+                        counts = torch.zeros((gaussians.get_xyz.shape[0],), device="cuda")
+                    gaussians.update_importance(counts, ema=args.importance_ema)
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
@@ -103,6 +116,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loss = loss + args.scale_reg * torch.abs(gaussians.get_scaling).mean()
 
         loss.backward()
+        if args.reloc_sampling == "error":
+            if gaussians._opacity.grad is not None:
+                with torch.no_grad():
+                    gaussians.update_error_importance(
+                        gaussians._opacity.grad.detach().abs().squeeze(-1),
+                        ema=args.error_ema
+                    )
 
         iter_end.record()
 

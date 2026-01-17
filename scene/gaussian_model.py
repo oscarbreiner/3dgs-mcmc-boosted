@@ -57,6 +57,11 @@ class GaussianModel:
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+        self.importance_score = torch.empty(0)
+        self.error_score = torch.empty(0)
+        self.reloc_sampling = "opacity"
+        self.importance_ema = 0.9
+        self.error_ema = 0.9
         self.setup_functions()
 
     def capture(self):
@@ -151,6 +156,11 @@ class GaussianModel:
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.importance_score = torch.zeros((self.get_xyz.shape[0],), device="cuda")
+        self.error_score = torch.zeros((self.get_xyz.shape[0],), device="cuda")
+        self.reloc_sampling = getattr(training_args, "reloc_sampling", "opacity")
+        self.importance_ema = getattr(training_args, "importance_ema", 0.9)
+        self.error_ema = getattr(training_args, "error_ema", 0.9)
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -304,6 +314,10 @@ class GaussianModel:
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+        if self.importance_score.numel() != 0:
+            self.importance_score = self.importance_score[valid_points_mask]
+        if self.error_score.numel() != 0:
+            self.error_score = self.error_score[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -342,6 +356,18 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        if self.importance_score.numel() != 0:
+            new_count = new_xyz.shape[0]
+            self.importance_score = torch.cat(
+                (self.importance_score, torch.zeros((new_count,), device="cuda")),
+                dim=0
+            )
+        if self.error_score.numel() != 0:
+            new_count = new_xyz.shape[0]
+            self.error_score = torch.cat(
+                (self.error_score, torch.zeros((new_count,), device="cuda")),
+                dim=0
+            )
 
         if reset_params:
             self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -408,6 +434,22 @@ class GaussianModel:
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
 
+    def update_importance(self, counts, ema=None):
+        if counts.numel() == 0:
+            return
+        if self.importance_score.numel() != counts.numel():
+            self.importance_score = torch.zeros_like(counts)
+        ema = self.importance_ema if ema is None else ema
+        self.importance_score.mul_(ema).add_(counts * (1.0 - ema))
+
+    def update_error_importance(self, scores, ema=None):
+        if scores.numel() == 0:
+            return
+        if self.error_score.numel() != scores.numel():
+            self.error_score = torch.zeros_like(scores)
+        ema = self.error_ema if ema is None else ema
+        self.error_score.mul_(ema).add_(scores * (1.0 - ema))
+
     def replace_tensors_to_optimizer(self, inds=None):
         tensors_dict = {"xyz": self._xyz,
             "f_dc": self._features_dc,
@@ -467,6 +509,26 @@ class GaussianModel:
             sampled_idxs = alive_indices[sampled_idxs]
         ratio = torch.bincount(sampled_idxs).unsqueeze(-1)
         return sampled_idxs, ratio
+
+    def _get_sampling_probs(self, indices=None):
+        if self.reloc_sampling == "importance":
+            probs = self.importance_score
+        elif self.reloc_sampling == "error":
+            probs = self.error_score
+        elif self.reloc_sampling == "hybrid":
+            probs = self.get_opacity.squeeze(-1) * self.importance_score
+        else:
+            probs = self.get_opacity.squeeze(-1)
+
+        if indices is not None:
+            probs = probs[indices]
+
+        if probs.sum() <= torch.finfo(probs.dtype).eps:
+            probs = self.get_opacity.squeeze(-1)
+            if indices is not None:
+                probs = probs[indices]
+
+        return probs
     
 
     def relocate_gs(self, dead_mask=None):
@@ -481,8 +543,8 @@ class GaussianModel:
         if alive_indices.shape[0] <= 0:
             return
 
-        # sample from alive ones based on opacity
-        probs = (self.get_opacity[alive_indices, 0]) 
+        # sample from alive ones based on configured relocation distribution
+        probs = self._get_sampling_probs(indices=alive_indices)
         reinit_idx, ratio = self._sample_alives(alive_indices=alive_indices, probs=probs, num=dead_indices.shape[0])
 
         (
@@ -508,7 +570,7 @@ class GaussianModel:
         if num_gs <= 0:
             return 0
 
-        probs = self.get_opacity.squeeze(-1) 
+        probs = self._get_sampling_probs()
         add_idx, ratio = self._sample_alives(probs=probs, num=num_gs)
 
         (
@@ -527,7 +589,6 @@ class GaussianModel:
         self.replace_tensors_to_optimizer(inds=add_idx)
 
         return num_gs
-
 
 
 

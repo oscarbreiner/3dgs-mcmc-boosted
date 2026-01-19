@@ -109,6 +109,7 @@ This project is built on top of the [Original 3DGS code base](https://github.com
     ```sh
     pip install plyfile tqdm torch==1.13.1+cu117 torchvision==0.14.1+cu117 torchaudio==0.13.1 --extra-index-url https://download.pytorch.org/whl/cu117
     conda install cudatoolkit-dev=11.7 -c conda-forge
+    pip install wandb  # For experiment tracking (recommended for SLURM)
     ```
 4. **Install Submodules:**
     ```sh
@@ -140,11 +141,32 @@ Running code is similar to the [Original 3DGS code base](https://github.com/grap
 python train.py --source_path PATH/TO/Shape --config configs/shape.json --eval
 ```
 
+## Experiment Tracking
+
+This project supports both **W&B** (recommended for SLURM) and **TensorBoard**.
+
+### W&B Setup (Recommended)
+
+```bash
+# One-time login
+wandb login
+
+# Or set API key in SLURM script
+export WANDB_API_KEY=your_api_key_here
+```
+
+### TensorBoard (Alternative)
+
+```bash
+tensorboard --logdir=output/your_run_directory
+```
+
+Requires SSH port forwarding: `ssh -L 6006:localhost:6006 your_cluster`
+
 ### Extended Features (Coming Soon)
 - Structure-aware noise steering with configurable loss signal (L1/SSIM)
 - Aggressive densification strategies
 - Enhanced sparse-view reconstruction
-
 
 
 

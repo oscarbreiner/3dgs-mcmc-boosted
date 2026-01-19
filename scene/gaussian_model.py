@@ -172,6 +172,7 @@ class GaussianModel:
         ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+        # self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15, capturable=True)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
@@ -534,18 +535,23 @@ class GaussianModel:
     def relocate_gs(self, dead_mask=None):
 
         if dead_mask.sum() == 0:
-            return
+            return {"num_relocated": 0, "mean_target_prob": 0.0}
 
         alive_mask = ~dead_mask 
         dead_indices = dead_mask.nonzero(as_tuple=True)[0]
         alive_indices = alive_mask.nonzero(as_tuple=True)[0]
 
         if alive_indices.shape[0] <= 0:
-            return
+            return {"num_relocated": 0, "mean_target_prob": 0.0}
 
         # sample from alive ones based on configured relocation distribution
         probs = self._get_sampling_probs(indices=alive_indices)
         reinit_idx, ratio = self._sample_alives(alive_indices=alive_indices, probs=probs, num=dead_indices.shape[0])
+        mean_target_prob = 0.0
+        if probs.numel() > 0:
+            pos = torch.searchsorted(alive_indices, reinit_idx)
+            sampled_probs = probs[pos]
+            mean_target_prob = float(sampled_probs.mean().item())
 
         (
             self._xyz[dead_indices], 
@@ -560,7 +566,8 @@ class GaussianModel:
         self._scaling[reinit_idx] = self._scaling[dead_indices]
 
         self.replace_tensors_to_optimizer(inds=reinit_idx) 
-        
+
+        return {"num_relocated": int(dead_indices.shape[0]), "mean_target_prob": mean_target_prob}
 
     def add_new_gs(self, cap_max):
         current_num_points = self._opacity.shape[0]
@@ -568,10 +575,13 @@ class GaussianModel:
         num_gs = max(0, target_num - current_num_points)
 
         if num_gs <= 0:
-            return 0
+            return {"num_added": 0, "mean_source_prob": 0.0}
 
         probs = self._get_sampling_probs()
         add_idx, ratio = self._sample_alives(probs=probs, num=num_gs)
+        mean_source_prob = 0.0
+        if probs.numel() > 0:
+            mean_source_prob = float(probs[add_idx].mean().item())
 
         (
             new_xyz, 
@@ -588,7 +598,5 @@ class GaussianModel:
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, reset_params=False)
         self.replace_tensors_to_optimizer(inds=add_idx)
 
-        return num_gs
-
-
+        return {"num_added": int(num_gs), "mean_source_prob": mean_source_prob}
 

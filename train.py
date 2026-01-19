@@ -13,7 +13,7 @@ import os
 import json
 import torch
 from random import randint
-from utils.loss_utils import l1_loss, ssim
+from utils.loss_utils import l1_loss, l1_loss_per_pixel, ssim
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -93,16 +93,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
         image = render_pkg["render"]
-
-        # Loss
         gt_image = viewpoint_cam.original_image.cuda()
+
+        # Dummy render to get weight coefficients
+        black_bg = torch.zeros((3), device="cuda")
+        fake_render = render(viewpoint_cam, gaussians, pipe, black_bg, override_color=gaussians.fake_color)["render"]
+        loss_per_pixel = l1_loss_per_pixel(image, gt_image).detach()  # [H, W]
+        fake_loss = torch.sum((fake_render * loss_per_pixel).view(-1))  # Weight fake_render by per-pixel L1 loss
+
+        # Compute loss and add fake auxilary loss which is allways 0
         Ll1 = l1_loss(image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + fake_loss
 
         loss = loss + args.opacity_reg * torch.abs(gaussians.get_opacity).mean()
         loss = loss + args.scale_reg * torch.abs(gaussians.get_scaling).mean()
 
         loss.backward()
+
+        # Gradients of the fake_color tensor yield per-gaussian blending weight
+        gaussians.error_contribution = gaussians.fake_color.grad[:, 0:1]
+        gaussians.fake_color.grad = None
 
         iter_end.record()
 
@@ -115,7 +125,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration == opt.iterations:
                 progress_bar.close()
 
-            # --- Custom Logging ---
+            # Custom Logging
             if tb_writer:
                 opacities = gaussians.get_opacity
                 is_dead = (opacities <= 0.005).squeeze()

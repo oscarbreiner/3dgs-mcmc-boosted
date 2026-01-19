@@ -17,6 +17,10 @@ from math import exp
 def l1_loss(network_output, gt):
     return torch.abs((network_output - gt)).mean()
 
+def l1_loss_per_pixel(network_output, gt):
+    """Compute L1 loss per pixel, returning a 2D map of per-pixel errors."""
+    return torch.abs(network_output - gt).mean(dim=0)  # Average over RGB channels, keep spatial dims
+
 def l2_loss(network_output, gt):
     return ((network_output - gt) ** 2).mean()
 

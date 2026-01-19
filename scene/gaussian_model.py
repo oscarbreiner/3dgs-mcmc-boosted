@@ -54,8 +54,8 @@ class GaussianModel:
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
-        self.per_gaussian_error = torch.empty(0)
-        self._dummy_error_vars = torch.empty(0)  # Dummy variables e_k for Section 3.2
+        self.fake_color = torch.empty(0)    # used to track blending weights
+        self.error_contribution = torch.empty(0)
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
@@ -73,7 +73,6 @@ class GaussianModel:
             self.max_radii2D,
             self.xyz_gradient_accum,
             self.denom,
-            self.per_gaussian_error,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
         )
@@ -89,13 +88,11 @@ class GaussianModel:
         self.max_radii2D, 
         xyz_gradient_accum, 
         denom,
-        per_gaussian_error,
         opt_dict, 
         self.spatial_lr_scale) = model_args
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
-        self.per_gaussian_error = per_gaussian_error
         self.optimizer.load_state_dict(opt_dict)
 
     @property
@@ -119,11 +116,6 @@ class GaussianModel:
     @property
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
-    
-    @property
-    def get_dummy_error_vars(self):
-        """Get dummy variables e_k for per-Gaussian error computation (Section 3.2)."""
-        return self._dummy_error_vars
     
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
@@ -156,19 +148,13 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        
-        # Initialize dummy variables for per-Gaussian error (Section 3.2)
-        self._dummy_error_vars = torch.zeros((fused_point_cloud.shape[0]), device="cuda", requires_grad=True)
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.per_gaussian_error = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        
-        # Initialize dummy variables for Section 3.2 per-Gaussian error computation
-        # These are initialized to 0 and never updated by the optimizer
-        self._dummy_error_vars = torch.zeros((self.get_xyz.shape[0]), device="cuda", requires_grad=True)
+        self.fake_color = torch.zeros_like(self._xyz, requires_grad=True, device="cuda")
+        self.error_contribution = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -184,6 +170,7 @@ class GaussianModel:
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=training_args.position_lr_max_steps)
+        
 
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
@@ -205,6 +192,7 @@ class GaussianModel:
             l.append('scale_{}'.format(i))
         for i in range(self._rotation.shape[1]):
             l.append('rot_{}'.format(i))
+        l.append('error_contrib')  # Only first column of gradient
         return l
 
     def save_ply(self, path):
@@ -217,11 +205,12 @@ class GaussianModel:
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
+        error_contribution = self.error_contribution.detach().cpu().numpy()
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation, error_contribution), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -323,6 +312,8 @@ class GaussianModel:
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
 
+        self.error_contribution = self.error_contribution[valid_points_mask]
+
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
@@ -360,6 +351,9 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+
+        # Update fake_color to match new number of Gaussians
+        self.fake_color = torch.zeros_like(self._xyz, requires_grad=True, device="cuda")
 
         if reset_params:
             self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")

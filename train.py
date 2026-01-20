@@ -13,6 +13,7 @@ import os
 import json
 import time
 import torch
+import numpy as np
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
@@ -77,13 +78,13 @@ def _subsample(tensor, max_samples):
     idx = torch.randperm(tensor.numel(), device=tensor.device)[:max_samples]
     return tensor[idx]
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, full_args):
     if dataset.cap_max == -1:
         print("Please specify the maximum number of Gaussians using --cap_max.")
         exit()
     first_iter = 0
     use_wandb = WANDB_FOUND
-    tb_writer = prepare_output_and_logger(dataset, use_wandb=use_wandb)
+    tb_writer = prepare_output_and_logger(full_args, use_wandb=use_wandb)
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
@@ -181,6 +182,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
         ssim_val = ssim(image, gt_image)
+        train_psnr = psnr(image, gt_image).mean()
         photometric_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_val)
 
         regularization_loss_opacity = args.opacity_reg * torch.abs(gaussians.get_opacity).mean()
@@ -259,25 +261,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 wandb.log({
                     # Core optimization signal
-                    "total_loss": float(loss.item()),
+                    "loss/total": float(loss.item()),
                     # Loss decomposition
-                    "photometric_loss": float(photometric_loss.item()),
-                    "regularization_loss_opacity": float(regularization_loss_opacity.item()),
-                    "regularization_loss_covariance": float(regularization_loss_covariance.item()),
+                    "loss/photometric": float(photometric_loss.item()),
+                    "loss/reg_opacity": float(regularization_loss_opacity.item()),
+                    "loss/reg_covariance": float(regularization_loss_covariance.item()),
                     # Rendering quality signals (training camera)
-                    "SSIM": float(ssim_val.item()),
+                    "quality/train_ssim": float(ssim_val.item()),
+                    "quality/train_psnr": float(train_psnr.item()),
+                    "loss/train_l1": float(Ll1.item()),
                     # Efficiency / optimizer
-                    "time/iter_ms": float(iter_start.elapsed_time(iter_end)),
+                    "perf/iter_ms": float(iter_start.elapsed_time(iter_end)),
                     "optim/xyz_lr": float(xyz_lr),
                     # Gaussian population
-                    "num_gaussians_total": num_gaussians_total_budget,
-                    "num_gaussians_alive": num_gaussians_alive,
-                    "num_gaussians_dead": num_gaussians_dead,
-                    "alive_ratio_percent": float(alive_ratio_percent),
+                    "pop/num_total": num_gaussians_total_budget,
+                    "pop/num_alive": num_gaussians_alive,
+                    "pop/num_dead": num_gaussians_dead,
+                    "pop/alive_ratio_percent": float(alive_ratio_percent),
                     # Visibility & importance (limited by available renderer outputs)
-                    "mean_blending_weight": float(mean_blending_weight),
-                    "num_max_contributor_gaussians": num_max_contributor_gaussians,
-                    "num_visible_gaussians": num_visible_gaussians,
+                    "vis/mean_blending_weight": float(mean_blending_weight),
+                    "vis/num_max_contributor": num_max_contributor_gaussians,
+                    "vis/num_visible": num_visible_gaussians,
                     # Relocation proxy stats
                     "proxy/name": proxy_name,
                     "proxy/mean": proxy_stats.get("mean"),
@@ -309,6 +313,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         }, step=iteration)
 
             if tb_writer:
+                tb_writer.add_scalar("train_loss_patches/psnr", train_psnr.item(), iteration)
                 proxy_vals = None
                 proxy_name = None
                 if args.reloc_sampling == "opacity":
@@ -391,13 +396,31 @@ def prepare_output_and_logger(args, use_wandb=True):
 
     if use_wandb:
         if WANDB_FOUND:
+            if getattr(args, "config", None):
+                dataset_name = os.path.splitext(os.path.basename(args.config))[0]
+            else:
+                dataset_name = os.path.basename(os.path.normpath(args.source_path))
+            project_name = "3dgs-mcmc-boosted-{}".format(dataset_name)
             wandb.init(
-                project="3dgs-mcmc-boosted",
+                project=project_name,
                 config=vars(args),
                 dir=args.model_path,
                 resume="allow"
             )
             if wandb.run is not None:
+                if wandb.run.name:
+                    reloc_name = getattr(args, "reloc_sampling", "opacity")
+                    importance_ema = getattr(args, "importance_ema", None)
+                    error_ema = getattr(args, "error_ema", None)
+                    ema_tag = ""
+                    if reloc_name == "importance" and importance_ema is not None:
+                        ema_tag = "-ema{}".format(importance_ema)
+                    elif reloc_name == "error" and error_ema is not None:
+                        ema_tag = "-ema{}".format(error_ema)
+                    elif reloc_name == "hybrid" and importance_ema is not None and error_ema is not None:
+                        ema_tag = "-ema{}-{}".format(importance_ema, error_ema)
+                    wandb.run.name = "{}{}-{}".format(reloc_name, ema_tag, wandb.run.name)
+                    print("W&B run name: {}".format(wandb.run.name))
                 if wandb.run.summary.get("train_start_wall_s") is None:
                     wandb.run.summary["train_start_wall_s"] = float(time.time())
             print("W&B logging enabled")
@@ -428,6 +451,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
+                wandb_images = []
                 for idx, viewpoint in enumerate(config['cameras']):
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
@@ -435,6 +459,11 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
                         if iteration == testing_iterations[0]:
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
+                    if WANDB_FOUND and wandb.run is not None and idx < 2:
+                        img = (image.detach().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                        gt = (gt_image.detach().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                        wandb_images.append(wandb.Image(img, caption="{} render {}".format(config['name'], viewpoint.image_name)))
+                        wandb_images.append(wandb.Image(gt, caption="{} gt {}".format(config['name'], viewpoint.image_name)))
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
                 psnr_test /= len(config['cameras'])
@@ -443,6 +472,15 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+                if WANDB_FOUND and wandb.run is not None:
+                    wandb.log({
+                        "eval/{}/l1".format(config['name']): float(l1_test),
+                        "eval/{}/psnr".format(config['name']): float(psnr_test),
+                    }, step=iteration)
+                    if wandb_images:
+                        wandb.log({
+                            "eval/{}/images".format(config['name']): wandb_images
+                        }, step=iteration)
 
         if tb_writer:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
@@ -503,7 +541,7 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     # network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args)
 
     # All done
     print("\nTraining complete.")

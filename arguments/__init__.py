@@ -95,6 +95,10 @@ class OptimizationParams(ParamGroup):
         self.reloc_sampling = "opacity"
         self.importance_ema = 0.9
         self.error_ema = 0.9
+        self.visibility_ema = 0.9
+        self.importance_mode = "count"
+        self.log_proxy_corr_all = False
+        self.psnr_threshold = -1.0
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

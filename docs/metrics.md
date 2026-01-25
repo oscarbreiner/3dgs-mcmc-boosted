@@ -30,6 +30,7 @@ This document describes the metrics currently logged during training, where they
 - `num_visible_gaussians` (W&B): Gaussians with non-zero screen radius in the current view.
 - `num_max_contributor_gaussians` (W&B): Gaussians that were max-contributor for at least one pixel in the current view.
 - `mean_blending_weight` (W&B): Mean opacity of visible Gaussians in the current view (proxy for average contribution weight).
+- `util/visible_over_alive` (W&B): Ratio of visible Gaussians to alive Gaussians in the current view.
 - `scene/opacity_histogram` (TB): Distribution of opacities at test iterations.
 
 Interpretation:
@@ -50,6 +51,14 @@ Scalar proxy stats (W&B and TB):
 - `proxy/corr_opacity`: Pearson correlation between proxy and opacity.
 - `proxy/name` (W&B): The active proxy name.
 
+Additional proxy correlation stats (enable with `--log_proxy_corr_all`):
+- `proxy_corr/importance`: Correlation between importance and opacity.
+- `proxy_corr/error`: Correlation between error and opacity.
+- `proxy_corr/hybrid`: Correlation between hybrid and opacity.
+- `proxy_corr/vis_opacity`: Correlation between visibility-weighted opacity and opacity.
+- `proxy_corr/vis_importance`: Correlation between visibility-weighted importance and opacity.
+- `proxy_corr/vis_hybrid`: Correlation between visibility-weighted hybrid and opacity.
+
 Distributions and plots:
 - `proxy/hist` (W&B): Histogram of proxy values, logged at the densification interval.
 - `proxy/<name>` (TB): Histogram of proxy values, logged at the densification interval.
@@ -60,6 +69,14 @@ Interpretation:
 - High `proxy/corr_opacity` means the proxy is close to opacity; low means it is exploring different structure.
 - A large `proxy/zero_frac` suggests sparse signals (common for importance/error early on).
 
+Quick reading guide:
+- The proxy is the per-Gaussian sampling weight used for relocation; logs summarize its distribution.
+- `proxy/mean`, `proxy/median`, `proxy/p95` describe the proxy scale and tail.
+- `proxy/zero_frac` shows how many Gaussians have no sampling weight.
+- `proxy/entropy` and `proxy/top1pct_share` tell you how concentrated sampling is.
+- `proxy/corr_opacity` tells you how similar the proxy is to opacity (near 1 means similar).
+- `proxy/opacity_scatter` is a visual check of how proxy relates to opacity when they differ.
+
 ## Relocation dynamics
 
 Logged at the densification interval:
@@ -68,6 +85,7 @@ Logged at the densification interval:
 - `reloc/mean_target_prob`: Mean sampling probability of relocation targets.
 - `reloc/num_added`: Number of new Gaussians added to reach the cap schedule.
 - `reloc/mean_source_prob`: Mean sampling probability of sources for newly added Gaussians.
+- `reloc/delta_photometric_loss` (W&B, TB): Change in photometric loss around relocation steps (logged on the next iteration, aligned to the relocation step).
 
 Interpretation:
 - If `reloc/num_dead` is high and persistent, consider adjusting regularization or relocation policy.
@@ -79,6 +97,13 @@ Interpretation:
 - `test/loss_viewpoint - psnr` (TB): PSNR on test views.
 - `train/loss_viewpoint - l1_loss` (TB): L1 loss on sampled train views.
 - `train/loss_viewpoint - psnr` (TB): PSNR on sampled train views.
+- `eval/time_to_threshold_iter` (W&B, TB): First iteration where test PSNR crosses `--psnr_threshold`.
+- `eval/time_to_threshold_s` (W&B, TB): Wall time in seconds to reach `--psnr_threshold`.
+- `eval/psnr_threshold` (W&B, TB): The configured threshold used for time-to-threshold logging.
+
+Logged only when `--psnr_threshold` > 0 and when test evaluation runs.
+
+Example threshold: for the bicycle scene, the established baseline final test PSNR is 26.07. Using a 90% target, set `--psnr_threshold 23.46` to track time-to-23.46.
 
 Interpretation:
 - Use PSNR/L1 trends to compare runs. Divergence between train and test indicates overfitting.

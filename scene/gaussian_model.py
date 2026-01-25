@@ -59,9 +59,11 @@ class GaussianModel:
         self.spatial_lr_scale = 0
         self.importance_score = torch.empty(0)
         self.error_score = torch.empty(0)
+        self.visibility_score = torch.empty(0)
         self.reloc_sampling = "opacity"
         self.importance_ema = 0.9
         self.error_ema = 0.9
+        self.visibility_ema = 0.9
         self.setup_functions()
 
     def capture(self):
@@ -158,9 +160,11 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.importance_score = torch.zeros((self.get_xyz.shape[0],), device="cuda")
         self.error_score = torch.zeros((self.get_xyz.shape[0],), device="cuda")
+        self.visibility_score = torch.zeros((self.get_xyz.shape[0],), device="cuda")
         self.reloc_sampling = getattr(training_args, "reloc_sampling", "opacity")
         self.importance_ema = getattr(training_args, "importance_ema", 0.9)
         self.error_ema = getattr(training_args, "error_ema", 0.9)
+        self.visibility_ema = getattr(training_args, "visibility_ema", 0.9)
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -319,6 +323,8 @@ class GaussianModel:
             self.importance_score = self.importance_score[valid_points_mask]
         if self.error_score.numel() != 0:
             self.error_score = self.error_score[valid_points_mask]
+        if self.visibility_score.numel() != 0:
+            self.visibility_score = self.visibility_score[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -367,6 +373,12 @@ class GaussianModel:
             new_count = new_xyz.shape[0]
             self.error_score = torch.cat(
                 (self.error_score, torch.zeros((new_count,), device="cuda")),
+                dim=0
+            )
+        if self.visibility_score.numel() != 0:
+            new_count = new_xyz.shape[0]
+            self.visibility_score = torch.cat(
+                (self.visibility_score, torch.zeros((new_count,), device="cuda")),
                 dim=0
             )
 
@@ -451,6 +463,14 @@ class GaussianModel:
         ema = self.error_ema if ema is None else ema
         self.error_score.mul_(ema).add_(scores * (1.0 - ema))
 
+    def update_visibility(self, visible_mask, ema=None):
+        if visible_mask.numel() == 0:
+            return
+        if self.visibility_score.numel() != visible_mask.numel():
+            self.visibility_score = torch.zeros_like(visible_mask, dtype=torch.float)
+        ema = self.visibility_ema if ema is None else ema
+        self.visibility_score.mul_(ema).add_(visible_mask.float() * (1.0 - ema))
+
     def replace_tensors_to_optimizer(self, inds=None):
         tensors_dict = {"xyz": self._xyz,
             "f_dc": self._features_dc,
@@ -512,14 +532,28 @@ class GaussianModel:
         return sampled_idxs, ratio
 
     def _get_sampling_probs(self, indices=None):
-        if self.reloc_sampling == "importance":
-            probs = self.importance_score
-        elif self.reloc_sampling == "error":
-            probs = self.error_score
-        elif self.reloc_sampling == "hybrid":
-            probs = self.get_opacity.squeeze(-1) * self.importance_score
+        eps = torch.finfo(torch.float32).eps
+        if self.reloc_sampling.startswith("vis_"):
+            if self.reloc_sampling == "vis_opacity":
+                base = self.get_opacity.squeeze(-1)
+            elif self.reloc_sampling == "vis_importance":
+                base = self.importance_score
+            elif self.reloc_sampling == "vis_hybrid":
+                base = self.get_opacity.squeeze(-1) * self.importance_score
+            else:
+                base = self.get_opacity.squeeze(-1)
+            probs = base * torch.clamp(self.visibility_score, min=eps)
         else:
-            probs = self.get_opacity.squeeze(-1)
+            if self.reloc_sampling == "random":
+                probs = torch.ones_like(self.get_opacity.squeeze(-1))
+            elif self.reloc_sampling == "importance":
+                probs = self.importance_score
+            elif self.reloc_sampling == "error":
+                probs = self.error_score
+            elif self.reloc_sampling == "hybrid":
+                probs = self.get_opacity.squeeze(-1) * self.importance_score
+            else:
+                probs = self.get_opacity.squeeze(-1)
 
         if indices is not None:
             probs = probs[indices]
@@ -599,4 +633,3 @@ class GaussianModel:
         self.replace_tensors_to_optimizer(inds=add_idx)
 
         return {"num_added": int(num_gs), "mean_source_prob": mean_source_prob}
-

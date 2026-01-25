@@ -72,6 +72,26 @@ def _proxy_stats(proxy_vals, opacity_vals):
     stats["corr_opacity"] = _safe_corrcoef(proxy_vals, opacity_vals)
     return stats
 
+def _all_proxy_values(gaussians, opacity_vals):
+    eps = torch.finfo(opacity_vals.dtype).eps
+    visibility = torch.clamp(gaussians.visibility_score.to(dtype=opacity_vals.dtype), min=eps)
+    return {
+        "importance": gaussians.importance_score,
+        "error": gaussians.error_score,
+        "hybrid": opacity_vals * gaussians.importance_score,
+        "vis_opacity": opacity_vals * visibility,
+        "vis_importance": gaussians.importance_score * visibility,
+        "vis_hybrid": opacity_vals * gaussians.importance_score * visibility,
+    }
+
+def _proxy_corrs(opacity_vals, proxy_map):
+    corrs = {}
+    for name, proxy_vals in proxy_map.items():
+        if proxy_vals is None or proxy_vals.numel() != opacity_vals.numel():
+            continue
+        corrs[name] = _safe_corrcoef(proxy_vals, opacity_vals)
+    return corrs
+
 def _subsample(tensor, max_samples):
     if tensor.numel() <= max_samples:
         return tensor
@@ -88,16 +108,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
+    log_proxy_corr_all = getattr(args, "log_proxy_corr_all", False)
     print(
-        "[Reloc] sampling={}, importance_ema={}, error_ema={}".format(
-            args.reloc_sampling, args.importance_ema, args.error_ema
+        "[Reloc] sampling={}, importance_ema={}, error_ema={}, log_proxy_corr_all={}".format(
+            args.reloc_sampling, args.importance_ema, args.error_ema, log_proxy_corr_all
         )
     )
     if tb_writer:
         tb_writer.add_text(
             "hparams/reloc_sampling",
-            "sampling={}, importance_ema={}, error_ema={}".format(
-                args.reloc_sampling, args.importance_ema, args.error_ema
+            "sampling={}, importance_ema={}, error_ema={}, log_proxy_corr_all={}".format(
+                args.reloc_sampling, args.importance_ema, args.error_ema, log_proxy_corr_all
             ),
         )
     if use_wandb and wandb.run is not None:
@@ -106,6 +127,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 "reloc_sampling": args.reloc_sampling,
                 "importance_ema": args.importance_ema,
                 "error_ema": args.error_ema,
+                "log_proxy_corr_all": log_proxy_corr_all,
             },
             allow_val_change=True,
         )
@@ -124,6 +146,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     proxy_log_interval = max(1, opt.densification_interval)
+    prev_photometric_loss = None
+    pending_reloc_prev_loss = None
+    pending_reloc_iter = None
+    psnr_threshold = float(getattr(args, "psnr_threshold", -1.0))
+    time_to_threshold_logged = False
+    train_start_wall_s = time.time()
 
     for iteration in range(first_iter, opt.iterations + 1):        
         # if network_gui.conn == None:
@@ -164,19 +192,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
         image = render_pkg["render"]
-        if args.reloc_sampling in ("importance", "hybrid"):
+        visibility_filter = render_pkg.get("visibility_filter")
+        if visibility_filter is not None and visibility_filter.numel() == gaussians.get_xyz.shape[0]:
+            with torch.no_grad():
+                gaussians.update_visibility(visibility_filter, ema=args.visibility_ema)
+        if args.reloc_sampling in ("importance", "hybrid", "vis_importance", "vis_hybrid") or log_proxy_corr_all:
             max_id = render_pkg.get("max_id")
             if max_id is not None:
                 with torch.no_grad():
                     valid = max_id >= 0
-                    if valid.any():
-                        counts = torch.bincount(
-                            max_id[valid].view(-1),
-                            minlength=gaussians.get_xyz.shape[0]
-                        ).float()
+                    if args.importance_mode == "count":
+                        if valid.any():
+                            counts = torch.bincount(
+                                max_id[valid].view(-1),
+                                minlength=gaussians.get_xyz.shape[0]
+                            ).float()
+                        else:
+                            counts = torch.zeros((gaussians.get_xyz.shape[0],), device="cuda")
+                        gaussians.update_importance(counts, ema=args.importance_ema)
+                    elif args.importance_mode == "wsum":
+                        raise AssertionError("importance_mode=wsum is not supported without max_weight from renderer")
                     else:
-                        counts = torch.zeros((gaussians.get_xyz.shape[0],), device="cuda")
-                    gaussians.update_importance(counts, ema=args.importance_ema)
+                        raise AssertionError("Unknown importance_mode: {}".format(args.importance_mode))
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
@@ -190,7 +227,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loss = photometric_loss + regularization_loss_opacity + regularization_loss_covariance
 
         loss.backward()
-        if args.reloc_sampling == "error":
+        if args.reloc_sampling == "error" or log_proxy_corr_all:
             if gaussians._opacity.grad is not None:
                 with torch.no_grad():
                     gaussians.update_error_importance(
@@ -201,6 +238,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         iter_end.record()
 
         with torch.no_grad():
+            if pending_reloc_iter is not None and iteration == pending_reloc_iter + 1:
+                delta_photometric_loss = float(photometric_loss.item()) - float(pending_reloc_prev_loss)
+                if use_wandb and wandb.run is not None:
+                    wandb.log({
+                        "reloc/delta_photometric_loss": delta_photometric_loss,
+                    }, step=pending_reloc_iter)
+                if tb_writer:
+                    tb_writer.add_scalar("reloc/delta_photometric_loss", delta_photometric_loss, pending_reloc_iter)
+                pending_reloc_iter = None
+                pending_reloc_prev_loss = None
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:
@@ -210,7 +257,37 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+            eval_metrics = training_report(
+                tb_writer,
+                iteration,
+                Ll1,
+                loss,
+                l1_loss,
+                iter_start.elapsed_time(iter_end),
+                testing_iterations,
+                scene,
+                render,
+                (pipe, background),
+            )
+            if (not time_to_threshold_logged) and psnr_threshold > 0:
+                eval_test = eval_metrics.get("test", {})
+                psnr_test = eval_test.get("psnr")
+                if psnr_test is not None and psnr_test >= psnr_threshold:
+                    time_to_threshold_s = float(time.time() - train_start_wall_s)
+                    if use_wandb and wandb.run is not None:
+                        wandb.log({
+                            "eval/time_to_threshold_iter": iteration,
+                            "eval/time_to_threshold_s": time_to_threshold_s,
+                            "eval/psnr_threshold": psnr_threshold,
+                        }, step=iteration)
+                        wandb.run.summary["eval/time_to_threshold_iter"] = int(iteration)
+                        wandb.run.summary["eval/time_to_threshold_s"] = float(time_to_threshold_s)
+                        wandb.run.summary["eval/psnr_threshold"] = float(psnr_threshold)
+                    if tb_writer:
+                        tb_writer.add_scalar("eval/time_to_threshold_iter", iteration, iteration)
+                        tb_writer.add_scalar("eval/time_to_threshold_s", time_to_threshold_s, iteration)
+                        tb_writer.add_scalar("eval/psnr_threshold", psnr_threshold, iteration)
+                    time_to_threshold_logged = True
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -242,7 +319,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 proxy_vals = None
                 proxy_name = None
-                if args.reloc_sampling == "opacity":
+                if args.reloc_sampling == "random":
+                    proxy_name = "random"
+                elif args.reloc_sampling == "opacity":
                     proxy_vals = opacity_vals
                     proxy_name = "opacity"
                 elif args.reloc_sampling == "importance":
@@ -258,8 +337,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 proxy_stats = {}
                 if proxy_vals is not None and proxy_vals.numel() == opacity_vals.numel():
                     proxy_stats = _proxy_stats(proxy_vals, opacity_vals)
+                proxy_corr_all = {}
+                if log_proxy_corr_all:
+                    proxy_corr_all = _proxy_corrs(opacity_vals, _all_proxy_values(gaussians, opacity_vals))
 
-                wandb.log({
+                wandb_log = {
                     # Core optimization signal
                     "loss/total": float(loss.item()),
                     # Loss decomposition
@@ -273,8 +355,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     # Efficiency / optimizer
                     "perf/iter_ms": float(iter_start.elapsed_time(iter_end)),
                     "optim/xyz_lr": float(xyz_lr),
-                    # Gaussian population
-                    "pop/num_total": num_gaussians_total_budget,
                     "pop/num_alive": num_gaussians_alive,
                     "pop/num_dead": num_gaussians_dead,
                     "pop/alive_ratio_percent": float(alive_ratio_percent),
@@ -282,6 +362,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     "vis/mean_blending_weight": float(mean_blending_weight),
                     "vis/num_max_contributor": num_max_contributor_gaussians,
                     "vis/num_visible": num_visible_gaussians,
+                    "util/visible_over_alive": float(num_visible_gaussians / max(1, num_gaussians_alive)),
                     # Relocation proxy stats
                     "proxy/name": proxy_name,
                     "proxy/mean": proxy_stats.get("mean"),
@@ -291,7 +372,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     "proxy/entropy": proxy_stats.get("entropy"),
                     "proxy/top1pct_share": proxy_stats.get("top1pct_share"),
                     "proxy/corr_opacity": proxy_stats.get("corr_opacity"),
-                }, step=iteration)
+                }
+                if proxy_corr_all:
+                    wandb_log.update({
+                        "proxy_corr/{}".format(name): value for name, value in proxy_corr_all.items()
+                    })
+                wandb.log(wandb_log, step=iteration)
 
                 if proxy_vals is not None and iteration % proxy_log_interval == 0:
                     proxy_cpu = _subsample(proxy_vals.detach(), 20000).cpu().numpy()
@@ -316,7 +402,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 tb_writer.add_scalar("train_loss_patches/psnr", train_psnr.item(), iteration)
                 proxy_vals = None
                 proxy_name = None
-                if args.reloc_sampling == "opacity":
+                if args.reloc_sampling == "random":
+                    proxy_name = "random"
+                elif args.reloc_sampling == "opacity":
                     proxy_vals = gaussians.get_opacity.squeeze(-1)
                     proxy_name = "opacity"
                 elif args.reloc_sampling == "importance":
@@ -340,11 +428,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     tb_writer.add_scalar("proxy/corr_opacity", proxy_stats.get("corr_opacity"), iteration)
                     if iteration % proxy_log_interval == 0:
                         tb_writer.add_histogram("proxy/{}".format(proxy_name), proxy_vals, iteration)
+                if log_proxy_corr_all:
+                    opacity_vals = gaussians.get_opacity.squeeze(-1)
+                    proxy_corr_all = _proxy_corrs(opacity_vals, _all_proxy_values(gaussians, opacity_vals))
+                    for name, value in proxy_corr_all.items():
+                        tb_writer.add_scalar("proxy_corr/{}".format(name), value, iteration)
 
             if iteration < opt.densify_until_iter and iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                 dead_mask = (gaussians.get_opacity <= 0.005).squeeze(-1)
                 reloc_info = gaussians.relocate_gs(dead_mask=dead_mask)
                 add_info = gaussians.add_new_gs(cap_max=args.cap_max)
+                if prev_photometric_loss is not None:
+                    pending_reloc_prev_loss = float(prev_photometric_loss)
+                    pending_reloc_iter = iteration
                 if use_wandb and wandb.run is not None:
                     wandb.log({
                         "reloc/num_dead": int(dead_mask.sum().item()),
@@ -379,6 +475,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+            prev_photometric_loss = float(photometric_loss.item())
 
 def prepare_output_and_logger(args, use_wandb=True):    
     if not args.model_path:
@@ -400,7 +497,8 @@ def prepare_output_and_logger(args, use_wandb=True):
                 dataset_name = os.path.splitext(os.path.basename(args.config))[0]
             else:
                 dataset_name = os.path.basename(os.path.normpath(args.source_path))
-            project_name = "3dgs-mcmc-boosted-{}".format(dataset_name)
+            init_type = getattr(args, "init_type", "random")
+            project_name = "3dgs-mcmc-boosted-{}-{}".format(dataset_name, init_type)
             wandb.init(
                 project=project_name,
                 config=vars(args),
@@ -419,10 +517,18 @@ def prepare_output_and_logger(args, use_wandb=True):
                         ema_tag = "-ema{}".format(error_ema)
                     elif reloc_name == "hybrid" and importance_ema is not None and error_ema is not None:
                         ema_tag = "-ema{}-{}".format(importance_ema, error_ema)
-                    wandb.run.name = "{}{}-{}".format(reloc_name, ema_tag, wandb.run.name)
+                    cap_max = int(getattr(args, "cap_max", -1))
+                    wandb.run.name = "{}{}-cap{}-{}".format(reloc_name, ema_tag, cap_max, wandb.run.name)
                     print("W&B run name: {}".format(wandb.run.name))
+                reloc_name = getattr(args, "reloc_sampling", "opacity")
+                cap_max = int(getattr(args, "cap_max", -1))
+                tags = list(wandb.run.tags) if wandb.run.tags else []
+                tags.extend(["proxy:{}".format(reloc_name), "cap:{}".format(cap_max)])
+                wandb.run.tags = list(dict.fromkeys(tags))
                 if wandb.run.summary.get("train_start_wall_s") is None:
                     wandb.run.summary["train_start_wall_s"] = float(time.time())
+                if wandb.run.summary.get("pop/num_total") is None:
+                    wandb.run.summary["pop/num_total"] = int(getattr(args, "cap_max", -1))
             print("W&B logging enabled")
         else:
             print("W&B not installed: skipping W&B logging")
@@ -436,6 +542,7 @@ def prepare_output_and_logger(args, use_wandb=True):
     return tb_writer
 
 def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
+    eval_metrics = {}
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -473,19 +580,38 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
                 if WANDB_FOUND and wandb.run is not None:
-                    wandb.log({
-                        "eval/{}/l1".format(config['name']): float(l1_test),
-                        "eval/{}/psnr".format(config['name']): float(psnr_test),
-                    }, step=iteration)
+                    wandb.run.summary["eval/{}/l1".format(config['name'])] = float(l1_test)
+                    wandb.run.summary["eval/{}/psnr".format(config['name'])] = float(psnr_test)
                     if wandb_images:
                         wandb.log({
                             "eval/{}/images".format(config['name']): wandb_images
                         }, step=iteration)
+                    wandb.log({
+                        "eval/{}/l1".format(config['name']): float(l1_test),
+                        "eval/{}/psnr".format(config['name']): float(psnr_test),
+                    }, step=iteration)
+                    best_psnr_key = "eval/{}/psnr_best".format(config['name'])
+                    best_psnr_iter_key = "eval/{}/psnr_best_iter".format(config['name'])
+                    best_l1_key = "eval/{}/l1_best".format(config['name'])
+                    best_l1_iter_key = "eval/{}/l1_best_iter".format(config['name'])
+                    prev_best_psnr = wandb.run.summary.get(best_psnr_key, None)
+                    prev_best_l1 = wandb.run.summary.get(best_l1_key, None)
+                    if prev_best_psnr is None or float(psnr_test) > float(prev_best_psnr):
+                        wandb.run.summary[best_psnr_key] = float(psnr_test)
+                        wandb.run.summary[best_psnr_iter_key] = int(iteration)
+                    if prev_best_l1 is None or float(l1_test) < float(prev_best_l1):
+                        wandb.run.summary[best_l1_key] = float(l1_test)
+                        wandb.run.summary[best_l1_iter_key] = int(iteration)
+                eval_metrics[config["name"]] = {
+                    "l1": float(l1_test),
+                    "psnr": float(psnr_test),
+                }
 
         if tb_writer:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
+    return eval_metrics
 
 def load_config(config_file):
     with open(config_file, 'r') as file:

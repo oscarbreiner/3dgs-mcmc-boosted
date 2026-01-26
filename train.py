@@ -36,6 +36,21 @@ try:
     WANDB_FOUND = True
 except ImportError:
     WANDB_FOUND = False
+try:
+    from lpipsPyTorch import LPIPS
+    LPIPS_FOUND = True
+except ImportError:
+    LPIPS_FOUND = False
+
+_LPIPS_NET_TYPE = "vgg"
+_LPIPS_MODEL = None
+
+def _get_lpips_model(device):
+    global _LPIPS_MODEL
+    if _LPIPS_MODEL is None or next(_LPIPS_MODEL.parameters()).device != device:
+        _LPIPS_MODEL = LPIPS(net_type=_LPIPS_NET_TYPE).to(device)
+        _LPIPS_MODEL.eval()
+    return _LPIPS_MODEL
 
 def _safe_corrcoef(x, y):
     if x.numel() < 2 or y.numel() < 2:
@@ -79,6 +94,7 @@ def _all_proxy_values(gaussians, opacity_vals):
         "importance": gaussians.importance_score,
         "error": gaussians.error_score,
         "hybrid": opacity_vals * gaussians.importance_score,
+        "visibility": gaussians.visibility_score,
         "vis_opacity": opacity_vals * visibility,
         "vis_importance": gaussians.importance_score * visibility,
         "vis_hybrid": opacity_vals * gaussians.importance_score * visibility,
@@ -146,6 +162,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     proxy_log_interval = max(1, opt.densification_interval)
+    proxy_scatter_interval = 10000
     prev_photometric_loss = None
     pending_reloc_prev_loss = None
     pending_reloc_iter = None
@@ -255,6 +272,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
+                final_wall_s = float(time.time() - train_start_wall_s)
+                num_gaussians_final = int(gaussians.get_xyz.shape[0])
+                opacity_vals_final = gaussians.get_opacity.squeeze(-1)
+                num_gaussians_alive_final = int((opacity_vals_final > 0.005).sum().item())
+                if use_wandb and wandb.run is not None:
+                    wandb.log({
+                        "train/total_time_s": final_wall_s,
+                        "pop/num_final": num_gaussians_final,
+                        "pop/num_final_million": num_gaussians_final / 1e6,
+                        "pop/num_final_alive": num_gaussians_alive_final,
+                    }, step=iteration)
+                    wandb.run.summary["train/total_time_s"] = final_wall_s
+                    wandb.run.summary["pop/num_final"] = num_gaussians_final
+                    wandb.run.summary["pop/num_final_million"] = num_gaussians_final / 1e6
+                    wandb.run.summary["pop/num_final_alive"] = num_gaussians_alive_final
+                if tb_writer:
+                    tb_writer.add_scalar("train/total_time_s", final_wall_s, iteration)
+                    tb_writer.add_scalar("pop/num_final", num_gaussians_final, iteration)
+                    tb_writer.add_scalar("pop/num_final_million", num_gaussians_final / 1e6, iteration)
+                    tb_writer.add_scalar("pop/num_final_alive", num_gaussians_alive_final, iteration)
 
             # Log and save
             eval_metrics = training_report(
@@ -321,6 +358,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 proxy_name = None
                 if args.reloc_sampling == "random":
                     proxy_name = "random"
+                elif args.reloc_sampling == "visibility":
+                    proxy_vals = gaussians.visibility_score
+                    proxy_name = "visibility"
                 elif args.reloc_sampling == "opacity":
                     proxy_vals = opacity_vals
                     proxy_name = "opacity"
@@ -380,12 +420,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 wandb.log(wandb_log, step=iteration)
 
                 if proxy_vals is not None and iteration % proxy_log_interval == 0:
-                    proxy_cpu = _subsample(proxy_vals.detach(), 20000).cpu().numpy()
-                    wandb.log({
-                        "proxy/hist": wandb.Histogram(proxy_cpu)
-                    }, step=iteration)
-                    if proxy_name != "opacity":
-                        sample_size = min(5000, proxy_vals.numel())
+                    if proxy_name != "opacity" and (iteration - 1) % proxy_scatter_interval == 0:
+                        sample_size = max(1, proxy_vals.numel() // 100)
                         idx = torch.randperm(proxy_vals.numel(), device=proxy_vals.device)[:sample_size]
                         opacity_cpu = opacity_vals.detach()[idx].cpu().numpy()
                         proxy_cpu_scatter = proxy_vals.detach()[idx].cpu().numpy()
@@ -396,7 +432,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                 table, "opacity", "proxy",
                                 title="Opacity vs {}".format(proxy_name)
                             )
-                        }, step=iteration)
+                        }, step=iteration - 1)
 
             if tb_writer:
                 tb_writer.add_scalar("train_loss_patches/psnr", train_psnr.item(), iteration)
@@ -404,6 +440,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 proxy_name = None
                 if args.reloc_sampling == "random":
                     proxy_name = "random"
+                elif args.reloc_sampling == "visibility":
+                    proxy_vals = gaussians.visibility_score
+                    proxy_name = "visibility"
                 elif args.reloc_sampling == "opacity":
                     proxy_vals = gaussians.get_opacity.squeeze(-1)
                     proxy_name = "opacity"
@@ -558,6 +597,12 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
+                ssim_test = 0.0
+                lpips_test = 0.0
+                is_test = config['name'] == "test"
+                lpips_model = None
+                if is_test and LPIPS_FOUND:
+                    lpips_model = _get_lpips_model(torch.device("cuda"))
                 wandb_images = []
                 for idx, viewpoint in enumerate(config['cameras']):
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
@@ -573,15 +618,39 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                         wandb_images.append(wandb.Image(gt, caption="{} gt {}".format(config['name'], viewpoint.image_name)))
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
+                    if is_test:
+                        ssim_test += ssim(image, gt_image).mean().double()
+                        if lpips_model is not None:
+                            lpips_test += lpips_model(image, gt_image).mean().double()
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])          
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                if is_test:
+                    ssim_test /= len(config['cameras'])
+                    if lpips_model is not None:
+                        lpips_test /= len(config['cameras'])
+                if is_test and lpips_model is not None:
+                    print("\n[ITER {}] Evaluating {}: L1 {} PSNR {} SSIM {} LPIPS {}".format(
+                        iteration, config['name'], l1_test, psnr_test, ssim_test, lpips_test))
+                elif is_test:
+                    print("\n[ITER {}] Evaluating {}: L1 {} PSNR {} SSIM {}".format(
+                        iteration, config['name'], l1_test, psnr_test, ssim_test))
+                else:
+                    print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(
+                        iteration, config['name'], l1_test, psnr_test))
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+                    if is_test:
+                        tb_writer.add_scalar(config['name'] + '/loss_viewpoint - ssim', ssim_test, iteration)
+                        if lpips_model is not None:
+                            tb_writer.add_scalar(config['name'] + '/loss_viewpoint - lpips', lpips_test, iteration)
                 if WANDB_FOUND and wandb.run is not None:
                     wandb.run.summary["eval/{}/l1".format(config['name'])] = float(l1_test)
                     wandb.run.summary["eval/{}/psnr".format(config['name'])] = float(psnr_test)
+                    if is_test:
+                        wandb.run.summary["eval/{}/ssim".format(config['name'])] = float(ssim_test)
+                        if lpips_model is not None:
+                            wandb.run.summary["eval/{}/lpips".format(config['name'])] = float(lpips_test)
                     if wandb_images:
                         wandb.log({
                             "eval/{}/images".format(config['name']): wandb_images
@@ -590,6 +659,14 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                         "eval/{}/l1".format(config['name']): float(l1_test),
                         "eval/{}/psnr".format(config['name']): float(psnr_test),
                     }, step=iteration)
+                    if is_test:
+                        wandb.log({
+                            "eval/{}/ssim".format(config['name']): float(ssim_test),
+                        }, step=iteration)
+                        if lpips_model is not None:
+                            wandb.log({
+                                "eval/{}/lpips".format(config['name']): float(lpips_test),
+                            }, step=iteration)
                     best_psnr_key = "eval/{}/psnr_best".format(config['name'])
                     best_psnr_iter_key = "eval/{}/psnr_best_iter".format(config['name'])
                     best_l1_key = "eval/{}/l1_best".format(config['name'])
@@ -606,6 +683,10 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     "l1": float(l1_test),
                     "psnr": float(psnr_test),
                 }
+                if is_test:
+                    eval_metrics[config["name"]]["ssim"] = float(ssim_test)
+                    if lpips_model is not None:
+                        eval_metrics[config["name"]]["lpips"] = float(lpips_test)
 
         if tb_writer:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)

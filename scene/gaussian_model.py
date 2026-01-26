@@ -546,6 +546,8 @@ class GaussianModel:
         else:
             if self.reloc_sampling == "random":
                 probs = torch.ones_like(self.get_opacity.squeeze(-1))
+            elif self.reloc_sampling == "visibility":
+                probs = self.visibility_score
             elif self.reloc_sampling == "importance":
                 probs = self.importance_score
             elif self.reloc_sampling == "error":

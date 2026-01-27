@@ -131,3 +131,38 @@ def safe_state(silent):
     np.random.seed(0)
     torch.manual_seed(0)
     torch.cuda.set_device(torch.device("cuda:0"))
+
+
+class WindowedAverage:
+    def __init__(self, window_size):
+        self.window_size = window_size
+        self.history = []
+        self.sum = None
+
+    def update(self, val):
+        # Detach to prevent keeping the graph in memory
+        val = val.detach()
+        
+        # Handle densification: if the number of points changes, reset history
+        if self.sum is not None and val.shape != self.sum.shape:
+            self.history = []
+            self.sum = None
+
+        # Initialize if empty or reset
+        if self.sum is None:
+            self.sum = torch.zeros_like(val)
+
+        # Update Sum and History
+        self.sum += val
+        self.history.append(val)
+
+        # Maintain window size
+        if len(self.history) > self.window_size:
+            removed = self.history.pop(0)
+            self.sum -= removed
+        
+        return self.sum / len(self.history)
+    
+    def reset(self):
+        self.history = []
+        self.sum = None

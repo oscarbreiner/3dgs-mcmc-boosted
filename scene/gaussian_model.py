@@ -359,6 +359,12 @@ class GaussianModel:
             self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
             self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
             self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+            self.error_contribution = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        else:
+            num_new = new_xyz.shape[0]
+            if num_new > 0:
+                zeros = torch.zeros((num_new, 1), device="cuda")
+                self.error_contribution = torch.cat((self.error_contribution, zeros), dim=0)
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]

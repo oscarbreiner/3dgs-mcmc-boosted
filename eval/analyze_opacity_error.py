@@ -57,12 +57,36 @@ def plot_correlation_heatmap(correlation_matrix, save_path=None):
     
     plt.show()
 
+def plot_scatter(opacity, error_contrib, save_path=None):
+    """Plot scatter plot of opacity vs error contribution."""
+    plt.figure(figsize=(10, 8))
+    
+    # Sample 1% of the points for better visualization
+    n_samples = max(1, int(len(opacity) * 0.01))
+    indices = np.random.choice(len(opacity), size=n_samples, replace=False)
+    opacity_sample = opacity[indices]
+    error_contrib_sample = error_contrib[indices]
+    
+    plt.scatter(opacity_sample, error_contrib_sample, alpha=0.5, s=10, c='purple', edgecolors='none')
+    plt.xlabel('Opacity', fontsize=12)
+    plt.ylabel('Error Contribution', fontsize=12)
+    plt.title(f'Opacity vs Error Contribution (1% sample: {n_samples} Gaussians)', fontsize=14)
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Saved scatter plot to {save_path}")
+    
+    plt.show()
+
 def plot_histograms(opacity, error_contrib, save_path=None):
     """Plot histograms for opacity and error contribution."""
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     
     # Opacity histogram
-    axes[0].hist(opacity, bins=50, color='blue', alpha=0.7, edgecolor='black')
+    axes[0].hist(opacity, bins=100, color='blue', alpha=0.7, edgecolor='black')
     axes[0].set_xlabel('Opacity', fontsize=12)
     axes[0].set_ylabel('Frequency', fontsize=12)
     axes[0].set_title('Histogram of Opacity Values', fontsize=14)
@@ -71,7 +95,7 @@ def plot_histograms(opacity, error_contrib, save_path=None):
     axes[0].legend()
     
     # Error contribution histogram
-    axes[1].hist(error_contrib, bins=50, color='green', alpha=0.7, edgecolor='black')
+    axes[1].hist(error_contrib, bins=100, color='green', alpha=0.7, edgecolor='black')
     axes[1].set_xlabel('Error Contribution', fontsize=12)
     axes[1].set_ylabel('Frequency', fontsize=12)
     axes[1].set_title('Histogram of Error Contribution Values', fontsize=14)
@@ -93,7 +117,7 @@ def main():
     ignore_zero_values = True  # Set to False to include zero error contribution values
     
     # Define path to PLY file
-    ply_path = "output/bicycle_random/point_cloud/iteration_3000/point_cloud.ply"
+    ply_path = "output/bicycle_random_original/point_cloud/iteration_10000/point_cloud.ply"
     
     # Check if file exists
     if not os.path.exists(ply_path):
@@ -105,6 +129,8 @@ def main():
     
     # Read data
     opacity, error_contrib = read_ply_attributes(ply_path)
+    # Apply sigmoid to error_contrib
+    error_contrib = (sigmoid(error_contrib) - 0.5) * 2
     
     print(f"\nLoaded {len(opacity)} Gaussians")
     print(f"Opacity range: [{opacity.min():.4f}, {opacity.max():.4f}]")
@@ -123,7 +149,7 @@ def main():
     
     # Filter out zero error contribution values if requested
     if ignore_zero_values:
-        nonzero_mask = error_contrib >= 0.05
+        nonzero_mask = error_contrib >= 0.01
         n_zero = np.sum(~nonzero_mask)
         opacity = opacity[nonzero_mask]
         error_contrib = error_contrib[nonzero_mask]
@@ -137,10 +163,13 @@ def main():
     print(f"\nCorrelation coefficient: {correlation_matrix[0, 1]:.4f}")
     
     # Plot correlation heatmap
-    plot_correlation_heatmap(correlation_matrix)
+    # plot_correlation_heatmap(correlation_matrix)
     
     # Plot histograms
     plot_histograms(opacity, error_contrib)
+    
+    # Plot scatter plot
+    plot_scatter(opacity, error_contrib)
 
 if __name__ == "__main__":
     main()

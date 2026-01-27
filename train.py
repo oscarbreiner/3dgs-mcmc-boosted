@@ -17,7 +17,7 @@ from utils.loss_utils import l1_loss, l1_loss_per_pixel, ssim
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
-from utils.general_utils import safe_state
+from utils.general_utils import safe_state, WindowedAverage
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
@@ -54,6 +54,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
 
+    # Initialize the running average tracker with a window of 100 for the error-guided noise
+    error_avg = WindowedAverage(100)
+
     for iteration in range(first_iter, opt.iterations + 1):        
         # if network_gui.conn == None:
         #     network_gui.try_connect()
@@ -82,6 +85,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
             viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+            # Reset the running max error to zero after each epoch
+            # gaussians.error_contribution.zero_()
+            # error_avg.reset()
         else:
             viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
@@ -111,8 +117,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loss.backward()
 
         # Gradients of the fake_color tensor yield per-gaussian blending weight
-        gaussians.error_contribution = gaussians.fake_color.grad[:, 0:1]
-        gaussians.fake_color.grad = None
+        with torch.no_grad():
+            current_error = gaussians.fake_color.grad[:, 0:1]
+            # gaussians.error_contribution = torch.max(gaussians.error_contribution, current_error)
+            gaussians.error_contribution = error_avg.update(current_error)
+            gaussians.fake_color.grad = None
+
 
         iter_end.record()
 
@@ -169,9 +179,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 def op_sigmoid(x, k=100, x0=0.995):
                     return 1 / (1 + torch.exp(-k * (x - x0)))
                 
-                noise = torch.randn_like(gaussians._xyz) * (op_sigmoid(1- gaussians.get_opacity))*args.noise_lr*xyz_lr
-                noise = torch.bmm(actual_covariance, noise.unsqueeze(-1)).squeeze(-1)
-                gaussians._xyz.add_(noise)
+                def op_linear(x):
+                    mean_val = x.mean()
+                    if mean_val > 1e-6:
+                        return torch.clamp(x / mean_val, 0, 1)
+                    return x
+                
+                if iteration < 25000:
+                    # noise_scale = (op_sigmoid(gaussians.error_contribution) + (op_sigmoid(1- gaussians.get_opacity))) * 0.5
+                    noise_scale = op_sigmoid(1-gaussians.get_opacity)
+                    noise = torch.randn_like(gaussians._xyz) * noise_scale * args.noise_lr * xyz_lr
+                    # noise = torch.randn_like(gaussians._xyz) * (op_sigmoid(1- gaussians.get_opacity))*args.noise_lr*xyz_lr
+                    noise = torch.bmm(actual_covariance, noise.unsqueeze(-1)).squeeze(-1)
+                    gaussians._xyz.add_(noise)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))

@@ -58,6 +58,7 @@ class GaussianModel:
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.importance_score = torch.empty(0)
+        self.importance_snapshot_score = torch.empty(0)
         self.error_score = torch.empty(0)
         self.visibility_score = torch.empty(0)
         self.reloc_sampling = "opacity"
@@ -159,6 +160,7 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.importance_score = torch.zeros((self.get_xyz.shape[0],), device="cuda")
+        self.importance_snapshot_score = torch.zeros((self.get_xyz.shape[0],), device="cuda")
         self.error_score = torch.zeros((self.get_xyz.shape[0],), device="cuda")
         self.visibility_score = torch.zeros((self.get_xyz.shape[0],), device="cuda")
         self.reloc_sampling = getattr(training_args, "reloc_sampling", "opacity")
@@ -321,6 +323,8 @@ class GaussianModel:
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         if self.importance_score.numel() != 0:
             self.importance_score = self.importance_score[valid_points_mask]
+        if self.importance_snapshot_score.numel() != 0:
+            self.importance_snapshot_score = self.importance_snapshot_score[valid_points_mask]
         if self.error_score.numel() != 0:
             self.error_score = self.error_score[valid_points_mask]
         if self.visibility_score.numel() != 0:
@@ -367,6 +371,12 @@ class GaussianModel:
             new_count = new_xyz.shape[0]
             self.importance_score = torch.cat(
                 (self.importance_score, torch.zeros((new_count,), device="cuda")),
+                dim=0
+            )
+        if self.importance_snapshot_score.numel() != 0:
+            new_count = new_xyz.shape[0]
+            self.importance_snapshot_score = torch.cat(
+                (self.importance_snapshot_score, torch.zeros((new_count,), device="cuda")),
                 dim=0
             )
         if self.error_score.numel() != 0:
@@ -454,6 +464,25 @@ class GaussianModel:
             self.importance_score = torch.zeros_like(counts)
         ema = self.importance_ema if ema is None else ema
         self.importance_score.mul_(ema).add_(counts * (1.0 - ema))
+
+    def update_importance_snapshot(self, counts, top_frac=0.01):
+        if counts.numel() == 0:
+            return
+        if self.importance_snapshot_score.numel() != counts.numel():
+            self.importance_snapshot_score = torch.zeros_like(counts)
+        if top_frac <= 0.0:
+            self.importance_snapshot_score.zero_()
+            return
+        k = max(1, int(top_frac * counts.numel()))
+        k = min(k, counts.numel())
+        topk_vals = torch.topk(counts, k=k).values
+        threshold = topk_vals.min()
+        self.importance_snapshot_score.copy_(counts)
+        self.importance_snapshot_score[counts < threshold] = 0.0
+
+    def clear_importance_snapshot(self):
+        if self.importance_snapshot_score.numel() != 0:
+            self.importance_snapshot_score.zero_()
 
     def update_error_importance(self, scores, ema=None):
         if scores.numel() == 0:
@@ -550,6 +579,8 @@ class GaussianModel:
                 probs = self.visibility_score
             elif self.reloc_sampling == "importance":
                 probs = self.importance_score
+            elif self.reloc_sampling == "importance_snapshot":
+                probs = self.importance_snapshot_score
             elif self.reloc_sampling == "error":
                 probs = self.error_score
             elif self.reloc_sampling == "hybrid":

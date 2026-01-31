@@ -92,6 +92,7 @@ def _all_proxy_values(gaussians, opacity_vals):
     visibility = torch.clamp(gaussians.visibility_score.to(dtype=opacity_vals.dtype), min=eps)
     return {
         "importance": gaussians.importance_score,
+        "importance_snapshot": gaussians.importance_snapshot_score,
         "error": gaussians.error_score,
         "hybrid": opacity_vals * gaussians.importance_score,
         "visibility": gaussians.visibility_score,
@@ -126,15 +127,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians.training_setup(opt)
     log_proxy_corr_all = getattr(args, "log_proxy_corr_all", False)
     print(
-        "[Reloc] sampling={}, importance_ema={}, error_ema={}, log_proxy_corr_all={}".format(
-            args.reloc_sampling, args.importance_ema, args.error_ema, log_proxy_corr_all
+        "[Reloc] sampling={}, importance_ema={}, error_ema={}, importance_snapshot_top_frac={}, log_proxy_corr_all={}".format(
+            args.reloc_sampling, args.importance_ema, args.error_ema, args.importance_snapshot_top_frac, log_proxy_corr_all
         )
     )
     if tb_writer:
         tb_writer.add_text(
             "hparams/reloc_sampling",
-            "sampling={}, importance_ema={}, error_ema={}, log_proxy_corr_all={}".format(
-                args.reloc_sampling, args.importance_ema, args.error_ema, log_proxy_corr_all
+            "sampling={}, importance_ema={}, error_ema={}, importance_snapshot_top_frac={}, log_proxy_corr_all={}".format(
+                args.reloc_sampling, args.importance_ema, args.error_ema, args.importance_snapshot_top_frac, log_proxy_corr_all
             ),
         )
     if use_wandb and wandb.run is not None:
@@ -143,6 +144,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 "reloc_sampling": args.reloc_sampling,
                 "importance_ema": args.importance_ema,
                 "error_ema": args.error_ema,
+                "importance_snapshot_top_frac": args.importance_snapshot_top_frac,
                 "log_proxy_corr_all": log_proxy_corr_all,
             },
             allow_val_change=True,
@@ -231,6 +233,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         raise AssertionError("importance_mode=wsum is not supported without max_weight from renderer")
                     else:
                         raise AssertionError("Unknown importance_mode: {}".format(args.importance_mode))
+        if args.reloc_sampling == "importance_snapshot":
+            max_id = render_pkg.get("max_id")
+            if max_id is not None:
+                with torch.no_grad():
+                    valid = max_id >= 0
+                    if valid.any():
+                        counts = torch.bincount(
+                            max_id[valid].view(-1),
+                            minlength=gaussians.get_xyz.shape[0]
+                        ).float()
+                    else:
+                            counts = torch.zeros((gaussians.get_xyz.shape[0],), device="cuda")
+                    if (iteration < opt.densify_until_iter
+                            and iteration > opt.densify_from_iter
+                            and iteration % opt.densification_interval == 0):
+                        gaussians.update_importance_snapshot(
+                            counts,
+                            top_frac=args.importance_snapshot_top_frac
+                        )
+                    else:
+                        gaussians.clear_importance_snapshot()
+            else:
+                gaussians.clear_importance_snapshot()
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
@@ -367,6 +392,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 elif args.reloc_sampling == "importance":
                     proxy_vals = gaussians.importance_score
                     proxy_name = "importance"
+                elif args.reloc_sampling == "importance_snapshot":
+                    proxy_vals = gaussians.importance_snapshot_score
+                    proxy_name = "importance_snapshot"
                 elif args.reloc_sampling == "error":
                     proxy_vals = gaussians.error_score
                     proxy_name = "error"
@@ -449,6 +477,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 elif args.reloc_sampling == "importance":
                     proxy_vals = gaussians.importance_score
                     proxy_name = "importance"
+                elif args.reloc_sampling == "importance_snapshot":
+                    proxy_vals = gaussians.importance_snapshot_score
+                    proxy_name = "importance_snapshot"
                 elif args.reloc_sampling == "error":
                     proxy_vals = gaussians.error_score
                     proxy_name = "error"
@@ -477,6 +508,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 dead_mask = (gaussians.get_opacity <= 0.005).squeeze(-1)
                 reloc_info = gaussians.relocate_gs(dead_mask=dead_mask)
                 add_info = gaussians.add_new_gs(cap_max=args.cap_max)
+                if args.reloc_sampling == "importance_snapshot":
+                    gaussians.clear_importance_snapshot()
                 if prev_photometric_loss is not None:
                     pending_reloc_prev_loss = float(prev_photometric_loss)
                     pending_reloc_iter = iteration

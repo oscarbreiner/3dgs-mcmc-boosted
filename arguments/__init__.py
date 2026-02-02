@@ -97,7 +97,13 @@ class OptimizationParams(ParamGroup):
         self.error_ema = 0.9
         self.visibility_ema = 0.9
         self.importance_mode = "count"
+        self.importance_snapshot_top_frac = 0.01
+        self.importance_update_interval = 1
+        self.importance_subsample_stride = 1
+        self.importance_subsample_ratio = 1.0
         self.log_proxy_corr_all = False
+        self.correlation_analysis = False
+        self.cleanup_random_ply = True
         self.psnr_threshold = 23.46
         super().__init__(parser, "Optimization Parameters")
 

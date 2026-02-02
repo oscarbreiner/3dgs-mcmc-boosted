@@ -41,6 +41,7 @@ class SceneInfo(NamedTuple):
     test_cameras: list
     nerf_normalization: dict
     ply_path: str
+    random_ply_path: str
 
 def getNerfppNorm(cam_info):
     def get_center_and_diag(cam_centers):
@@ -154,6 +155,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, init_type="sfm", num_pts
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
+    pcd = None
     if init_type == "sfm":
         ply_path = os.path.join(path, "sparse/0/points3D.ply")
         bin_path = os.path.join(path, "sparse/0/points3D.bin")
@@ -166,7 +168,8 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, init_type="sfm", num_pts
                 xyz, rgb, _ = read_points3D_text(txt_path)
             storePly(ply_path, xyz, rgb)
     elif init_type == "random":
-        ply_path = os.path.join(path, "random.ply")
+        run_tag = os.environ.get("SLURM_JOB_ID") or str(os.getpid())
+        ply_path = os.path.join(path, "random_{}.ply".format(run_tag))
         print(f"Generating random point cloud ({num_pts})...")
         
         xyz = np.random.random((num_pts, 3)) * nerf_normalization["radius"]* 3*2 -(nerf_normalization["radius"]*3)
@@ -180,16 +183,19 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, init_type="sfm", num_pts
         print("Please specify a correct init_type: random or sfm")
         exit(0)
 
-    try:
-        pcd = fetchPly(ply_path)
-    except:
-        pcd = None
+    if pcd is None:
+        try:
+            pcd = fetchPly(ply_path)
+        except:
+            pcd = None
 
+    random_ply_path = ply_path if init_type == "random" else None
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
                            test_cameras=test_cam_infos,
                            nerf_normalization=nerf_normalization,
-                           ply_path=ply_path)
+                           ply_path=ply_path,
+                           random_ply_path=random_ply_path)
     return scene_info
 
 def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png"):

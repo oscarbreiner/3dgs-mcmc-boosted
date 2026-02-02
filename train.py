@@ -12,6 +12,7 @@
 import os
 import json
 import time
+import math
 import torch
 import numpy as np
 from random import randint
@@ -37,6 +38,11 @@ try:
 except ImportError:
     WANDB_FOUND = False
 try:
+    import mlflow
+    MLFLOW_FOUND = True
+except ImportError:
+    MLFLOW_FOUND = False
+try:
     from lpipsPyTorch import LPIPS
     LPIPS_FOUND = True
 except ImportError:
@@ -44,6 +50,88 @@ except ImportError:
 
 _LPIPS_NET_TYPE = "vgg"
 _LPIPS_MODEL = None
+_MLFLOW_ACTIVE = False
+_MLFLOW_ENABLED = False
+
+def _mlflow_log_params_safe(params):
+    if not _MLFLOW_ACTIVE:
+        return
+    safe_params = {}
+    for key, value in params.items():
+        if isinstance(value, (list, tuple, dict)):
+            safe_params[key] = json.dumps(value)
+        else:
+            safe_params[key] = str(value)
+    chunk = {}
+    for key, value in safe_params.items():
+        chunk[key] = value
+        if len(chunk) >= 100:
+            mlflow.log_params(chunk)
+            chunk = {}
+    if chunk:
+        mlflow.log_params(chunk)
+
+def _mlflow_log_metrics(metrics, step=None):
+    if not _MLFLOW_ACTIVE:
+        return
+    safe_metrics = {}
+    for key, value in metrics.items():
+        if value is None:
+            continue
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(numeric):
+            continue
+        safe_metrics[key] = numeric
+    if safe_metrics:
+        mlflow.log_metrics(safe_metrics, step=step)
+
+def _mlflow_set_tag_safe(key, value):
+    if not _MLFLOW_ACTIVE:
+        return
+    if value is None:
+        return
+    mlflow.set_tag(str(key), str(value))
+
+def _mlflow_log_image(name, image_np, iteration):
+    if not _MLFLOW_ACTIVE:
+        return
+    log_image = getattr(mlflow, "log_image", None)
+    if log_image is None:
+        return
+    artifact_name = "{}/{}.png".format(int(iteration), name)
+    log_image(image_np, artifact_file=artifact_name)
+
+def _mlflow_start_run(args, project_name, mlflow_enabled):
+    global _MLFLOW_ACTIVE
+    global _MLFLOW_ENABLED
+    _MLFLOW_ENABLED = bool(mlflow_enabled)
+    if not _MLFLOW_ENABLED:
+        return False
+    if not MLFLOW_FOUND:
+        print("MLflow not installed: skipping MLflow logging")
+        return False
+    if _MLFLOW_ACTIVE:
+        return True
+    mlflow.set_experiment(project_name)
+    run_name = getattr(args, "wandb_run_name", None) or getattr(args, "run_name", None)
+    mlflow.start_run(run_name=run_name)
+    tags = {
+        "model_path": str(getattr(args, "model_path", "")),
+        "reloc_sampling": str(getattr(args, "reloc_sampling", "")),
+        "cap_max": str(getattr(args, "cap_max", "")),
+        "correlation_analysis": str(bool(getattr(args, "correlation_analysis", False))),
+    }
+    mlflow.set_tags(tags)
+    _mlflow_log_params_safe(vars(args))
+    cfg_path = os.path.join(args.model_path, "cfg_args")
+    if os.path.exists(cfg_path):
+        mlflow.log_artifact(cfg_path)
+    print("MLflow logging enabled")
+    _MLFLOW_ACTIVE = True
+    return True
 
 def _get_lpips_model(device):
     global _LPIPS_MODEL
@@ -115,6 +203,92 @@ def _subsample(tensor, max_samples):
     idx = torch.randperm(tensor.numel(), device=tensor.device)[:max_samples]
     return tensor[idx]
 
+def _subsample_max_id(max_id, stride=1, ratio=1.0):
+    if max_id is None or max_id.numel() == 0:
+        return max_id, 1.0
+    stride = max(1, int(stride))
+    ratio = float(ratio)
+    ratio = min(max(ratio, 0.0), 1.0)
+    total = max_id.numel()
+    sampled = max_id
+    if stride > 1 and sampled.dim() >= 2:
+        sampled = sampled[::stride, ::stride]
+    if ratio < 1.0:
+        flat = sampled.reshape(-1)
+        sample_size = max(1, int(ratio * flat.numel()))
+        idx = torch.randperm(flat.numel(), device=flat.device)[:sample_size]
+        sampled = flat[idx]
+    sampled_numel = sampled.numel()
+    if sampled_numel == 0:
+        return sampled, 1.0
+    scale = float(total) / float(sampled_numel)
+    return sampled, scale
+
+def _append_corr_scatter_rows(
+    path,
+    iteration,
+    gaussians,
+    raw_visibility=None,
+    raw_importance=None,
+    sample_frac=0.01,
+):
+    opacity = gaussians.get_opacity.squeeze(-1)
+    num = int(opacity.numel())
+    if num == 0:
+        return path
+    sample_size = max(1, int(sample_frac * num))
+    idx = torch.randperm(num, device=opacity.device)[:sample_size]
+
+    def _safe_gather(tensor, fallback_nan=True):
+        if tensor is None or tensor.numel() != num:
+            if fallback_nan:
+                return torch.full((sample_size,), float("nan"), device=opacity.device)
+            return None
+        return tensor[idx]
+
+    importance = _safe_gather(gaussians.importance_score)
+    visibility = _safe_gather(gaussians.visibility_score)
+    error = _safe_gather(gaussians.error_score)
+    raw_visibility = _safe_gather(raw_visibility)
+    raw_importance = _safe_gather(raw_importance)
+
+    opacity_cpu = opacity[idx].detach().cpu().numpy()
+    importance_cpu = importance.detach().cpu().numpy()
+    visibility_cpu = visibility.detach().cpu().numpy()
+    error_cpu = error.detach().cpu().numpy()
+    raw_visibility_cpu = raw_visibility.detach().cpu().numpy()
+    raw_importance_cpu = raw_importance.detach().cpu().numpy()
+    idx_cpu = idx.detach().cpu().numpy()
+
+    expected_header = (
+        "step,gaussian_idx,opacity,importance,visibility,error,raw_importance,raw_visibility\n"
+    )
+    header_needed = not os.path.exists(path)
+    if not header_needed:
+        with open(path, "r", encoding="utf-8") as f:
+            first_line = f.readline()
+        if first_line and first_line != expected_header:
+            base, ext = os.path.splitext(path)
+            path = "{}_raw{}".format(base, ext or ".csv")
+            header_needed = True
+    with open(path, "a", encoding="utf-8") as f:
+        if header_needed:
+            f.write(expected_header)
+        for i in range(sample_size):
+            f.write(
+                "{},{},{},{},{},{},{},{}\n".format(
+                    int(iteration),
+                    int(idx_cpu[i]),
+                    float(opacity_cpu[i]),
+                    float(importance_cpu[i]),
+                    float(visibility_cpu[i]),
+                    float(error_cpu[i]),
+                    float(raw_importance_cpu[i]),
+                    float(raw_visibility_cpu[i]),
+                )
+            )
+    return path
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, full_args):
     if dataset.cap_max == -1:
         print("Please specify the maximum number of Gaussians using --cap_max.")
@@ -124,18 +298,38 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     tb_writer = prepare_output_and_logger(full_args, use_wandb=use_wandb)
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
+    random_ply_path = getattr(scene.scene_info, "random_ply_path", None)
     gaussians.training_setup(opt)
     log_proxy_corr_all = getattr(args, "log_proxy_corr_all", False)
+    correlation_analysis = bool(getattr(args, "correlation_analysis", False))
+    corr_scatter_path = None
+    corr_log_interval = 300
     print(
-        "[Reloc] sampling={}, importance_ema={}, error_ema={}, importance_snapshot_top_frac={}, log_proxy_corr_all={}".format(
-            args.reloc_sampling, args.importance_ema, args.error_ema, args.importance_snapshot_top_frac, log_proxy_corr_all
+        "[Reloc] sampling={}, importance_ema={}, error_ema={}, importance_snapshot_top_frac={}, importance_update_interval={}, importance_subsample_stride={}, importance_subsample_ratio={}, log_proxy_corr_all={}, correlation_analysis={}".format(
+            args.reloc_sampling,
+            args.importance_ema,
+            args.error_ema,
+            args.importance_snapshot_top_frac,
+            getattr(args, "importance_update_interval", 1),
+            getattr(args, "importance_subsample_stride", 1),
+            getattr(args, "importance_subsample_ratio", 1.0),
+            log_proxy_corr_all,
+            correlation_analysis,
         )
     )
     if tb_writer:
         tb_writer.add_text(
             "hparams/reloc_sampling",
-            "sampling={}, importance_ema={}, error_ema={}, importance_snapshot_top_frac={}, log_proxy_corr_all={}".format(
-                args.reloc_sampling, args.importance_ema, args.error_ema, args.importance_snapshot_top_frac, log_proxy_corr_all
+            "sampling={}, importance_ema={}, error_ema={}, importance_snapshot_top_frac={}, importance_update_interval={}, importance_subsample_stride={}, importance_subsample_ratio={}, log_proxy_corr_all={}, correlation_analysis={}".format(
+                args.reloc_sampling,
+                args.importance_ema,
+                args.error_ema,
+                args.importance_snapshot_top_frac,
+                getattr(args, "importance_update_interval", 1),
+                getattr(args, "importance_subsample_stride", 1),
+                getattr(args, "importance_subsample_ratio", 1.0),
+                log_proxy_corr_all,
+                correlation_analysis,
             ),
         )
     if use_wandb and wandb.run is not None:
@@ -145,9 +339,39 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 "importance_ema": args.importance_ema,
                 "error_ema": args.error_ema,
                 "importance_snapshot_top_frac": args.importance_snapshot_top_frac,
+                "importance_update_interval": getattr(args, "importance_update_interval", 1),
+                "importance_subsample_stride": getattr(args, "importance_subsample_stride", 1),
+                "importance_subsample_ratio": getattr(args, "importance_subsample_ratio", 1.0),
                 "log_proxy_corr_all": log_proxy_corr_all,
+                "correlation_analysis": correlation_analysis,
             },
             allow_val_change=True,
+        )
+        _mlflow_log_params_safe(
+            {
+                "reloc_sampling": args.reloc_sampling,
+                "importance_ema": args.importance_ema,
+                "error_ema": args.error_ema,
+                "importance_snapshot_top_frac": args.importance_snapshot_top_frac,
+                "importance_update_interval": getattr(args, "importance_update_interval", 1),
+                "importance_subsample_stride": getattr(args, "importance_subsample_stride", 1),
+                "importance_subsample_ratio": getattr(args, "importance_subsample_ratio", 1.0),
+                "log_proxy_corr_all": log_proxy_corr_all,
+                "correlation_analysis": correlation_analysis,
+            }
+        )
+        _mlflow_log_params_safe(
+            {
+                "reloc_sampling": args.reloc_sampling,
+                "importance_ema": args.importance_ema,
+                "error_ema": args.error_ema,
+                "importance_snapshot_top_frac": args.importance_snapshot_top_frac,
+                "importance_update_interval": getattr(args, "importance_update_interval", 1),
+                "importance_subsample_stride": getattr(args, "importance_subsample_stride", 1),
+                "importance_subsample_ratio": getattr(args, "importance_subsample_ratio", 1.0),
+                "log_proxy_corr_all": log_proxy_corr_all,
+                "correlation_analysis": correlation_analysis,
+            }
         )
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -165,12 +389,39 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter += 1
     proxy_log_interval = max(1, opt.densification_interval)
     proxy_scatter_interval = 10000
+    importance_update_interval = max(1, int(getattr(args, "importance_update_interval", 1)))
     prev_photometric_loss = None
     pending_reloc_prev_loss = None
     pending_reloc_iter = None
     psnr_threshold = float(getattr(args, "psnr_threshold", -1.0))
     time_to_threshold_logged = False
     train_start_wall_s = time.time()
+
+    if correlation_analysis:
+        corr_scatter_path = os.path.join(args.model_path, "correlation_scatter.csv")
+        with torch.no_grad():
+            corr_scatter_path = _append_corr_scatter_rows(
+                corr_scatter_path, 0, gaussians, sample_frac=0.01
+            )
+        if use_wandb and wandb.run is not None:
+            opacity_vals = gaussians.get_opacity.squeeze(-1)
+            corr_sources = {
+                "opacity": opacity_vals,
+                "importance": gaussians.importance_score,
+                "visibility": gaussians.visibility_score,
+            }
+            corr_log = {}
+            for a_name, a_vals in corr_sources.items():
+                for b_name, b_vals in corr_sources.items():
+                    if a_vals is None or b_vals is None:
+                        corr_log["corr/{}_{}".format(a_name, b_name)] = float("nan")
+                        continue
+                    if a_vals.numel() != b_vals.numel() or a_vals.numel() == 0:
+                        corr_log["corr/{}_{}".format(a_name, b_name)] = float("nan")
+                        continue
+                    corr_log["corr/{}_{}".format(a_name, b_name)] = _safe_corrcoef(a_vals, b_vals)
+            wandb.log(corr_log, step=0)
+            _mlflow_log_metrics(corr_log, step=0)
 
     for iteration in range(first_iter, opt.iterations + 1):        
         # if network_gui.conn == None:
@@ -215,17 +466,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if visibility_filter is not None and visibility_filter.numel() == gaussians.get_xyz.shape[0]:
             with torch.no_grad():
                 gaussians.update_visibility(visibility_filter, ema=args.visibility_ema)
-        if args.reloc_sampling in ("importance", "hybrid", "vis_importance", "vis_hybrid") or log_proxy_corr_all:
+        compute_importance = (
+            args.reloc_sampling in ("importance", "hybrid", "vis_importance", "vis_hybrid")
+            or log_proxy_corr_all
+        )
+        if correlation_analysis:
+            # Only compute importance when we will log correlation_scatter.csv.
+            compute_importance = compute_importance or (iteration % corr_log_interval == 0)
+        if compute_importance:
             max_id = render_pkg.get("max_id")
-            if max_id is not None:
+            if max_id is not None and (iteration % importance_update_interval == 0):
                 with torch.no_grad():
-                    valid = max_id >= 0
+                    max_id_sub, scale = _subsample_max_id(
+                        max_id,
+                        stride=getattr(args, "importance_subsample_stride", 1),
+                        ratio=getattr(args, "importance_subsample_ratio", 1.0),
+                    )
+                    valid = max_id_sub >= 0
                     if args.importance_mode == "count":
                         if valid.any():
                             counts = torch.bincount(
-                                max_id[valid].view(-1),
+                                max_id_sub[valid].view(-1),
                                 minlength=gaussians.get_xyz.shape[0]
-                            ).float()
+                            ).float() * scale
                         else:
                             counts = torch.zeros((gaussians.get_xyz.shape[0],), device="cuda")
                         gaussians.update_importance(counts, ema=args.importance_ema)
@@ -234,26 +497,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     else:
                         raise AssertionError("Unknown importance_mode: {}".format(args.importance_mode))
         if args.reloc_sampling == "importance_snapshot":
-            max_id = render_pkg.get("max_id")
-            if max_id is not None:
-                with torch.no_grad():
-                    valid = max_id >= 0
-                    if valid.any():
-                        counts = torch.bincount(
-                            max_id[valid].view(-1),
-                            minlength=gaussians.get_xyz.shape[0]
-                        ).float()
-                    else:
+            if (iteration < opt.densify_until_iter
+                    and iteration > opt.densify_from_iter
+                    and iteration % opt.densification_interval == 0):
+                max_id = render_pkg.get("max_id")
+                if max_id is not None:
+                    with torch.no_grad():
+                        valid = max_id >= 0
+                        if valid.any():
+                            counts = torch.bincount(
+                                max_id[valid].view(-1),
+                                minlength=gaussians.get_xyz.shape[0]
+                            ).float()
+                        else:
                             counts = torch.zeros((gaussians.get_xyz.shape[0],), device="cuda")
-                    if (iteration < opt.densify_until_iter
-                            and iteration > opt.densify_from_iter
-                            and iteration % opt.densification_interval == 0):
                         gaussians.update_importance_snapshot(
                             counts,
                             top_frac=args.importance_snapshot_top_frac
                         )
-                    else:
-                        gaussians.clear_importance_snapshot()
+                else:
+                    gaussians.clear_importance_snapshot()
             else:
                 gaussians.clear_importance_snapshot()
 
@@ -269,7 +532,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loss = photometric_loss + regularization_loss_opacity + regularization_loss_covariance
 
         loss.backward()
-        if args.reloc_sampling == "error" or log_proxy_corr_all:
+        if args.reloc_sampling == "error" or log_proxy_corr_all or correlation_analysis:
             if gaussians._opacity.grad is not None:
                 with torch.no_grad():
                     gaussians.update_error_importance(
@@ -286,6 +549,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     wandb.log({
                         "reloc/delta_photometric_loss": delta_photometric_loss,
                     }, step=pending_reloc_iter)
+                    _mlflow_log_metrics(
+                        {"reloc/delta_photometric_loss": delta_photometric_loss},
+                        step=pending_reloc_iter,
+                    )
                 if tb_writer:
                     tb_writer.add_scalar("reloc/delta_photometric_loss", delta_photometric_loss, pending_reloc_iter)
                 pending_reloc_iter = None
@@ -308,6 +575,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         "pop/num_final_million": num_gaussians_final / 1e6,
                         "pop/num_final_alive": num_gaussians_alive_final,
                     }, step=iteration)
+                    _mlflow_log_metrics(
+                        {
+                            "train/total_time_s": final_wall_s,
+                            "pop/num_final": num_gaussians_final,
+                            "pop/num_final_million": num_gaussians_final / 1e6,
+                            "pop/num_final_alive": num_gaussians_alive_final,
+                        },
+                        step=iteration,
+                    )
                     wandb.run.summary["train/total_time_s"] = final_wall_s
                     wandb.run.summary["pop/num_final"] = num_gaussians_final
                     wandb.run.summary["pop/num_final_million"] = num_gaussians_final / 1e6
@@ -342,6 +618,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             "eval/time_to_threshold_s": time_to_threshold_s,
                             "eval/psnr_threshold": psnr_threshold,
                         }, step=iteration)
+                        _mlflow_log_metrics(
+                            {
+                                "eval/time_to_threshold_iter": iteration,
+                                "eval/time_to_threshold_s": time_to_threshold_s,
+                                "eval/psnr_threshold": psnr_threshold,
+                            },
+                            step=iteration,
+                        )
                         wandb.run.summary["eval/time_to_threshold_iter"] = int(iteration)
                         wandb.run.summary["eval/time_to_threshold_s"] = float(time_to_threshold_s)
                         wandb.run.summary["eval/psnr_threshold"] = float(psnr_threshold)
@@ -445,9 +729,57 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     wandb_log.update({
                         "proxy_corr/{}".format(name): value for name, value in proxy_corr_all.items()
                     })
+                if correlation_analysis and (iteration % corr_log_interval == 0):
+                    corr_sources = {
+                        "opacity": opacity_vals,
+                        "importance": gaussians.importance_score,
+                        "visibility": gaussians.visibility_score,
+                    }
+                    for a_name, a_vals in corr_sources.items():
+                        for b_name, b_vals in corr_sources.items():
+                            if a_vals is None or b_vals is None:
+                                wandb_log["corr/{}_{}".format(a_name, b_name)] = float("nan")
+                                continue
+                            if a_vals.numel() != b_vals.numel() or a_vals.numel() == 0:
+                                wandb_log["corr/{}_{}".format(a_name, b_name)] = float("nan")
+                                continue
+                            wandb_log["corr/{}_{}".format(a_name, b_name)] = _safe_corrcoef(a_vals, b_vals)
                 wandb.log(wandb_log, step=iteration)
+                _mlflow_log_metrics(wandb_log, step=iteration)
 
-                if proxy_vals is not None and iteration % proxy_log_interval == 0:
+            if correlation_analysis and (iteration % corr_log_interval == 0):
+                with torch.no_grad():
+                    raw_visibility = None
+                    if visibility_filter is not None and visibility_filter.numel() == gaussians.get_xyz.shape[0]:
+                        raw_visibility = visibility_filter.float()
+                    raw_importance = None
+                    max_id = render_pkg.get("max_id")
+                    if max_id is not None:
+                        max_id_sub, scale = _subsample_max_id(
+                            max_id,
+                            stride=getattr(args, "importance_subsample_stride", 1),
+                            ratio=getattr(args, "importance_subsample_ratio", 1.0),
+                        )
+                        valid = max_id_sub >= 0
+                        if valid.any():
+                            raw_importance = torch.bincount(
+                                max_id_sub[valid].view(-1),
+                                minlength=gaussians.get_xyz.shape[0],
+                            ).float() * scale
+                        else:
+                            raw_importance = torch.zeros(
+                                (gaussians.get_xyz.shape[0],), device="cuda"
+                            )
+                    corr_scatter_path = _append_corr_scatter_rows(
+                        corr_scatter_path,
+                        iteration,
+                        gaussians,
+                        raw_visibility=raw_visibility,
+                        raw_importance=raw_importance,
+                        sample_frac=0.01,
+                    )
+
+            if proxy_vals is not None and iteration % proxy_log_interval == 0:
                     if proxy_name != "opacity" and (iteration - 1) % proxy_scatter_interval == 0:
                         sample_size = max(1, proxy_vals.numel() // 100)
                         idx = torch.randperm(proxy_vals.numel(), device=proxy_vals.device)[:sample_size]
@@ -521,6 +853,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         "reloc/num_added": add_info.get("num_added"),
                         "reloc/mean_source_prob": add_info.get("mean_source_prob"),
                     }, step=iteration)
+                    _mlflow_log_metrics(
+                        {
+                            "reloc/num_dead": int(dead_mask.sum().item()),
+                            "reloc/num_relocated": reloc_info.get("num_relocated"),
+                            "reloc/mean_target_prob": reloc_info.get("mean_target_prob"),
+                            "reloc/num_added": add_info.get("num_added"),
+                            "reloc/mean_source_prob": add_info.get("mean_source_prob"),
+                        },
+                        step=iteration,
+                    )
                 if tb_writer:
                     tb_writer.add_scalar("reloc/num_dead", int(dead_mask.sum().item()), iteration)
                     tb_writer.add_scalar("reloc/num_relocated", reloc_info.get("num_relocated"), iteration)
@@ -549,13 +891,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
             prev_photometric_loss = float(photometric_loss.item())
 
+    if getattr(full_args, "cleanup_random_ply", False):
+        try:
+            if random_ply_path and os.path.exists(random_ply_path):
+                os.remove(random_ply_path)
+        except Exception:
+            pass
+    if _MLFLOW_ACTIVE:
+        mlflow.end_run()
+
 def prepare_output_and_logger(args, use_wandb=True):    
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
             unique_str=os.getenv('OAR_JOB_ID')
         else:
             unique_str = str(uuid.uuid4())
-        args.model_path = os.path.join("./output/", unique_str[0:10])
+        if bool(getattr(args, "correlation_analysis", False)):
+            reloc_tag = getattr(args, "reloc_sampling", "opacity")
+            run_id = "cor_ana_{}_{}".format(reloc_tag, unique_str[:8])
+        else:
+            run_id = unique_str[0:10]
+        args.model_path = os.path.join("./output/", run_id)
         
     # Set up output folder
     print("Output folder: {}".format(args.model_path))
@@ -563,6 +919,7 @@ def prepare_output_and_logger(args, use_wandb=True):
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(args))))
 
+    mlflow_enabled = bool(getattr(args, "mlflow", False)) or use_wandb
     if use_wandb:
         if WANDB_FOUND:
             if getattr(args, "config", None):
@@ -571,13 +928,21 @@ def prepare_output_and_logger(args, use_wandb=True):
                 dataset_name = os.path.basename(os.path.normpath(args.source_path))
             init_type = getattr(args, "init_type", "random")
             project_name = "3dgs-mcmc-boosted-{}-{}".format(dataset_name, init_type)
+            if bool(getattr(args, "correlation_analysis", False)):
+                project_name = "{}-correlation-analysis".format(project_name)
+            project_name = getattr(args, "wandb_project", None) or project_name
             wandb.init(
                 project=project_name,
                 config=vars(args),
                 dir=args.model_path,
                 resume="allow"
             )
+            _mlflow_start_run(args, project_name, mlflow_enabled)
             if wandb.run is not None:
+                if getattr(args, "wandb_run_name", None):
+                    wandb.run.name = str(args.wandb_run_name)
+                if wandb.run.name:
+                    _mlflow_set_tag_safe("wandb_run_name", wandb.run.name)
                 if wandb.run.name:
                     reloc_name = getattr(args, "reloc_sampling", "opacity")
                     importance_ema = getattr(args, "importance_ema", None)
@@ -592,11 +957,13 @@ def prepare_output_and_logger(args, use_wandb=True):
                     cap_max = int(getattr(args, "cap_max", -1))
                     wandb.run.name = "{}{}-cap{}-{}".format(reloc_name, ema_tag, cap_max, wandb.run.name)
                     print("W&B run name: {}".format(wandb.run.name))
+                    _mlflow_set_tag_safe("wandb_run_name", wandb.run.name)
                 reloc_name = getattr(args, "reloc_sampling", "opacity")
                 cap_max = int(getattr(args, "cap_max", -1))
                 tags = list(wandb.run.tags) if wandb.run.tags else []
                 tags.extend(["proxy:{}".format(reloc_name), "cap:{}".format(cap_max)])
                 wandb.run.tags = list(dict.fromkeys(tags))
+                _mlflow_set_tag_safe("wandb_tags", ",".join(wandb.run.tags))
                 if wandb.run.summary.get("train_start_wall_s") is None:
                     wandb.run.summary["train_start_wall_s"] = float(time.time())
                 if wandb.run.summary.get("pop/num_total") is None:
@@ -604,6 +971,19 @@ def prepare_output_and_logger(args, use_wandb=True):
             print("W&B logging enabled")
         else:
             print("W&B not installed: skipping W&B logging")
+            if mlflow_enabled:
+                print("MLflow not started because W&B is disabled")
+    else:
+        if mlflow_enabled:
+            if getattr(args, "config", None):
+                dataset_name = os.path.splitext(os.path.basename(args.config))[0]
+            else:
+                dataset_name = os.path.basename(os.path.normpath(args.source_path))
+            init_type = getattr(args, "init_type", "random")
+            project_name = "3dgs-mcmc-boosted-{}-{}".format(dataset_name, init_type)
+            if bool(getattr(args, "correlation_analysis", False)):
+                project_name = "{}-correlation-analysis".format(project_name)
+            _mlflow_start_run(args, project_name, mlflow_enabled)
 
     # Create Tensorboard writer
     tb_writer = None
@@ -649,6 +1029,16 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                         gt = (gt_image.detach().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
                         wandb_images.append(wandb.Image(img, caption="{} render {}".format(config['name'], viewpoint.image_name)))
                         wandb_images.append(wandb.Image(gt, caption="{} gt {}".format(config['name'], viewpoint.image_name)))
+                        _mlflow_log_image(
+                            "eval/{}/render_{}".format(config['name'], viewpoint.image_name),
+                            img,
+                            iteration,
+                        )
+                        _mlflow_log_image(
+                            "eval/{}/gt_{}".format(config['name'], viewpoint.image_name),
+                            gt,
+                            iteration,
+                        )
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
                     if is_test:
@@ -684,6 +1074,15 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                         wandb.run.summary["eval/{}/ssim".format(config['name'])] = float(ssim_test)
                         if lpips_model is not None:
                             wandb.run.summary["eval/{}/lpips".format(config['name'])] = float(lpips_test)
+                    _mlflow_log_metrics(
+                        {
+                            "eval/{}/l1".format(config['name']): float(l1_test),
+                            "eval/{}/psnr".format(config['name']): float(psnr_test),
+                            "eval/{}/ssim".format(config['name']): float(ssim_test) if is_test else None,
+                            "eval/{}/lpips".format(config['name']): float(lpips_test) if is_test and lpips_model is not None else None,
+                        },
+                        step=iteration,
+                    )
                     if wandb_images:
                         wandb.log({
                             "eval/{}/images".format(config['name']): wandb_images
@@ -692,14 +1091,29 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                         "eval/{}/l1".format(config['name']): float(l1_test),
                         "eval/{}/psnr".format(config['name']): float(psnr_test),
                     }, step=iteration)
+                    _mlflow_log_metrics(
+                        {
+                            "eval/{}/l1".format(config['name']): float(l1_test),
+                            "eval/{}/psnr".format(config['name']): float(psnr_test),
+                        },
+                        step=iteration,
+                    )
                     if is_test:
                         wandb.log({
                             "eval/{}/ssim".format(config['name']): float(ssim_test),
                         }, step=iteration)
+                        _mlflow_log_metrics(
+                            {"eval/{}/ssim".format(config['name']): float(ssim_test)},
+                            step=iteration,
+                        )
                         if lpips_model is not None:
                             wandb.log({
                                 "eval/{}/lpips".format(config['name']): float(lpips_test),
                             }, step=iteration)
+                            _mlflow_log_metrics(
+                                {"eval/{}/lpips".format(config['name']): float(lpips_test)},
+                                step=iteration,
+                            )
                     best_psnr_key = "eval/{}/psnr_best".format(config['name'])
                     best_psnr_iter_key = "eval/{}/psnr_best_iter".format(config['name'])
                     best_l1_key = "eval/{}/l1_best".format(config['name'])
@@ -709,9 +1123,23 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     if prev_best_psnr is None or float(psnr_test) > float(prev_best_psnr):
                         wandb.run.summary[best_psnr_key] = float(psnr_test)
                         wandb.run.summary[best_psnr_iter_key] = int(iteration)
+                        _mlflow_log_metrics(
+                            {
+                                best_psnr_key: float(psnr_test),
+                                best_psnr_iter_key: int(iteration),
+                            },
+                            step=iteration,
+                        )
                     if prev_best_l1 is None or float(l1_test) < float(prev_best_l1):
                         wandb.run.summary[best_l1_key] = float(l1_test)
                         wandb.run.summary[best_l1_iter_key] = int(iteration)
+                        _mlflow_log_metrics(
+                            {
+                                best_l1_key: float(l1_test),
+                                best_l1_iter_key: int(iteration),
+                            },
+                            step=iteration,
+                        )
                 eval_metrics[config["name"]] = {
                     "l1": float(l1_test),
                     "psnr": float(psnr_test),
@@ -759,6 +1187,9 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--wandb_project", type=str, default=None)
+    parser.add_argument("--wandb_run_name", type=str, default=None)
+    parser.add_argument("--mlflow", action="store_true", default=False)
     argv = sys.argv[1:]
     args = parser.parse_args(argv)
     

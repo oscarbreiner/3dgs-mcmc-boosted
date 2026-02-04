@@ -40,7 +40,13 @@ class Scene:
         self.train_cameras = {}
         self.test_cameras = {}
 
-        if os.path.exists(os.path.join(args.source_path, "sparse")):
+        if os.path.exists(os.path.join(args.source_path, "dslr", "nerfstudio", "transforms.json")) \
+           or os.path.exists(os.path.join(args.source_path, "dslr", "nerfstudio", "transforms_undistorted.json")) \
+           or os.path.exists(os.path.join(args.source_path, "iphone", "nerfstudio", "transforms.json")):
+            scene_info = sceneLoadTypeCallbacks["ScanNetPP"](args.source_path, args.images, args.eval,
+                                                             white_background=args.white_background,
+                                                             init_type=args.init_type)
+        elif os.path.exists(os.path.join(args.source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, init_type=args.init_type)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")

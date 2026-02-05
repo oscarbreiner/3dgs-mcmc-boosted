@@ -6,5 +6,5 @@
 	url = https://gitlab.inria.fr/sibr/sibr_core.git
 [submodule "submodules/diff-gaussian-rasterization"]
 	path = submodules/diff-gaussian-rasterization
-	url = git@github.com:oscarbreiner/diff-gaussian-rasterization.git
+	url = https://github.com/oscarbreiner/diff-gaussian-rasterization.git
 	branch = feature/importance-relocation

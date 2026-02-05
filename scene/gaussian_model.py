@@ -208,6 +208,10 @@ class GaussianModel:
         for i in range(self._rotation.shape[1]):
             l.append('rot_{}'.format(i))
         l.append('error_contrib')  # Only first column of gradient
+        if self.importance_score.numel() != 0:
+            l.append('importance_score')
+        if self.visibility_score.numel() != 0:
+            l.append('visibility_score')
         return l
 
     def save_ply(self, path):
@@ -221,11 +225,21 @@ class GaussianModel:
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
         error_contribution = self.error_contribution.detach().cpu().numpy()
+        importance_score = None
+        visibility_score = None
+        if self.importance_score.numel() != 0:
+            importance_score = self.importance_score.detach().cpu().numpy()[..., np.newaxis]
+        if self.visibility_score.numel() != 0:
+            visibility_score = self.visibility_score.detach().cpu().numpy()[..., np.newaxis]
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
         attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation, error_contribution), axis=1)
+        if importance_score is not None:
+            attributes = np.concatenate((attributes, importance_score), axis=1)
+        if visibility_score is not None:
+            attributes = np.concatenate((attributes, visibility_score), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)

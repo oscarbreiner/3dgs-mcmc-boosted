@@ -166,3 +166,27 @@ class WindowedAverage:
     def reset(self):
         self.history = []
         self.sum = None
+
+
+class ExponentialMovingAverage:
+    def __init__(self, ema=0.9):
+        self.ema = ema
+        self.value = None
+
+    def update(self, val, ema=None):
+        # Detach to prevent keeping the graph in memory
+        val = val.detach()
+
+        # Handle densification: if the number of points changes, reset state
+        if self.value is not None and val.shape != self.value.shape:
+            self.value = None
+
+        if self.value is None:
+            self.value = torch.zeros_like(val)
+
+        ema_val = self.ema if ema is None else ema
+        self.value.mul_(ema_val).add_(val * (1.0 - ema_val))
+        return self.value
+
+    def reset(self):
+        self.value = None

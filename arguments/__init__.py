@@ -92,6 +92,8 @@ class OptimizationParams(ParamGroup):
         self.noise_lr = 5e5
         self.scale_reg = 0.01
         self.opacity_reg = 0.01
+
+        # Relocation parameters
         self.reloc_sampling = "opacity"
         self.importance_ema = 0.9
         self.error_ema = 0.9
@@ -99,6 +101,18 @@ class OptimizationParams(ParamGroup):
         self.importance_mode = "count"
         self.log_proxy_corr_all = False
         self.psnr_threshold = 23.46
+
+        # Noise parameters
+        self.per_pixel_error_metric = "l1"
+        self.error_averaging = "moving_average"
+        self.noise_ema = 0.9
+        self.moving_average_window_size = 50
+        self.per_pixel_patch_size = 1
+        self.noise_guidance = "opacity"
+        self.noise_percentile_threshold = -1
+        self.noise_absolute_threshold = 0.02
+        self.noise_amplification = 1.0
+        
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

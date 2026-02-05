@@ -15,11 +15,11 @@ import time
 import torch
 import numpy as np
 from random import randint
-from utils.loss_utils import l1_loss, l1_loss_per_pixel, ssim
+from utils.loss_utils import l1_loss, l1_loss_per_pixel, ssim, psnr_per_pixel, windowed_l1_per_pixel
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
-from utils.general_utils import safe_state, WindowedAverage
+from utils.general_utils import safe_state, WindowedAverage, ExponentialMovingAverage
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
@@ -44,6 +44,15 @@ except ImportError:
 
 _LPIPS_NET_TYPE = "vgg"
 _LPIPS_MODEL = None
+
+def op_sigmoid(x, k=100, x0=0.995):
+    return 1 / (1 + torch.exp(-k * (x - x0)))
+                
+def op_linear(x):
+    mean_val = x.mean()
+    if mean_val > 1e-6:
+        return torch.clamp(x / mean_val, 0, 1)
+    return x
 
 def _get_lpips_model(device):
     global _LPIPS_MODEL
@@ -114,10 +123,17 @@ def _subsample(tensor, max_samples):
     idx = torch.randperm(tensor.numel(), device=tensor.device)[:max_samples]
     return tensor[idx]
 
+
+
+
+################################################################
+#####                     TRAINING                         #####
+################################################################
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, full_args):
     if dataset.cap_max == -1:
         print("Please specify the maximum number of Gaussians using --cap_max.")
         exit()
+    
     first_iter = 0
     use_wandb = WANDB_FOUND
     tb_writer = prepare_output_and_logger(full_args, use_wandb=use_wandb)
@@ -125,11 +141,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
     log_proxy_corr_all = getattr(args, "log_proxy_corr_all", False)
-    print(
-        "[Reloc] sampling={}, importance_ema={}, error_ema={}, log_proxy_corr_all={}".format(
-            args.reloc_sampling, args.importance_ema, args.error_ema, log_proxy_corr_all
-        )
-    )
     if tb_writer:
         tb_writer.add_text(
             "hparams/reloc_sampling",
@@ -171,24 +182,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     train_start_wall_s = time.time()
 
     # Initialize the running average tracker with a window of 100 for the error-guided noise
-    error_avg = WindowedAverage(100)
+    if opt.error_averaging == "moving_average":
+        error_avg = WindowedAverage(opt.moving_average_window_size)
+    elif opt.error_averaging == "ema":
+        error_avg = ExponentialMovingAverage(opt.noise_ema)
 
     for iteration in range(first_iter, opt.iterations + 1):        
-        # if network_gui.conn == None:
-        #     network_gui.try_connect()
-        # while network_gui.conn != None:
-        #     try:
-        #         net_image_bytes = None
-        #         custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
-        #         if custom_cam != None:
-        #             net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer)["render"]
-        #             net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
-        #         network_gui.send(net_image_bytes, dataset.source_path)
-        #         if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
-        #             break
-        #     except Exception as e:
-        #         network_gui.conn = None
-
         iter_start.record()
 
         xyz_lr = gaussians.update_learning_rate(iteration)
@@ -201,9 +200,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
             viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
-            # Reset the running max error to zero after each epoch
-            # gaussians.error_contribution.zero_()
-            # error_avg.reset()
         else:
             viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
@@ -216,6 +212,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
         image = render_pkg["render"]
         visibility_filter = render_pkg.get("visibility_filter")
+
+        # Oscar edit
         if visibility_filter is not None and visibility_filter.numel() == gaussians.get_xyz.shape[0]:
             with torch.no_grad():
                 gaussians.update_visibility(visibility_filter, ema=args.visibility_ema)
@@ -244,7 +242,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Dummy render to get weight coefficients
         black_bg = torch.zeros((3), device="cuda")
         fake_render = render(viewpoint_cam, gaussians, pipe, black_bg, override_color=gaussians.fake_color)["render"]
-        loss_per_pixel = l1_loss_per_pixel(image, gt_image).detach()  # [H, W]
+
+        # Chose the desired per pixel loss
+        if opt.per_pixel_error_metric == "l1" and opt.per_pixel_patch_size == 1:
+            loss_per_pixel = l1_loss_per_pixel(image, gt_image)
+        elif opt.per_piexl_error_metric == "l1" and opt.per_pixel_patch_size > 1:
+            loss_per_pixel = windowed_l1_per_pixel(image, gt_image, opt.per_pixel_patch_size)
+        elif opt.per_pixel_error_metric == "psnr":
+            loss_per_pixel = psnr_per_pixel(image, gt_image, opt.per_pixel_patch_size)
+
         fake_loss = torch.sum((fake_render * loss_per_pixel).view(-1))  # Weight fake_render by per-pixel L1 loss
 
         # Compute loss and add fake auxilary loss which is allways 0
@@ -265,10 +271,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Gradients of the fake_color tensor yield per-gaussian blending weight
         with torch.no_grad():
             current_error = gaussians.fake_color.grad[:, 0:1]
-            # gaussians.error_contribution = torch.max(gaussians.error_contribution, current_error)
             gaussians.error_contribution = error_avg.update(current_error)
             gaussians.fake_color.grad = None
 
+        # Oscar edit
         if args.reloc_sampling == "error" or log_proxy_corr_all:
             if gaussians._opacity.grad is not None:
                 with torch.no_grad():
@@ -319,8 +325,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     tb_writer.add_scalar("pop/num_final_alive", num_gaussians_alive_final, iteration)
 
             
-                
-
             # Log and save
             eval_metrics = training_report(
                 tb_writer,
@@ -353,6 +357,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         tb_writer.add_scalar("eval/time_to_threshold_s", time_to_threshold_s, iteration)
                         tb_writer.add_scalar("eval/psnr_threshold", psnr_threshold, iteration)
                     time_to_threshold_logged = True
+
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -461,11 +466,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                 title="Opacity vs {}".format(proxy_name)
                             )
                         }, step=iteration - 1)
-
+            # Tensorboard logging
             if tb_writer:
-
                 opacities = gaussians.get_opacity
-                
                 # Log Opacity Stats (Logging every single value is too heavy, we log stats + histogram)
                 tb_writer.add_scalar('scene/opacity_mean', opacities.mean().item(), iteration)
                 tb_writer.add_scalar('scene/opacity_min', opacities.min().item(), iteration)
@@ -503,12 +506,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     tb_writer.add_scalar("proxy/corr_opacity", proxy_stats.get("corr_opacity"), iteration)
                     if iteration % proxy_log_interval == 0:
                         tb_writer.add_histogram("proxy/{}".format(proxy_name), proxy_vals, iteration)
+                        if gaussians.importance_score.numel() != 0:
+                            tb_writer.add_histogram("proxy/importance", gaussians.importance_score, iteration)
+                        if gaussians.error_contribution.numel() != 0:
+                            tb_writer.add_histogram(
+                                "proxy/error_contribution",
+                                gaussians.error_contribution.squeeze(-1),
+                                iteration,
+                            )
                 if log_proxy_corr_all:
                     opacity_vals = gaussians.get_opacity.squeeze(-1)
                     proxy_corr_all = _proxy_corrs(opacity_vals, _all_proxy_values(gaussians, opacity_vals))
                     for name, value in proxy_corr_all.items():
                         tb_writer.add_scalar("proxy_corr/{}".format(name), value, iteration)
 
+            # Apply relocation an log
             if iteration < opt.densify_until_iter and iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                 dead_mask = (gaussians.get_opacity <= 0.005).squeeze(-1)
                 reloc_info = gaussians.relocate_gs(dead_mask=dead_mask)
@@ -531,40 +543,82 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     tb_writer.add_scalar("reloc/num_added", add_info.get("num_added"), iteration)
                     tb_writer.add_scalar("reloc/mean_source_prob", add_info.get("mean_source_prob"), iteration)
 
-            # Log relocated count (will be 0 for most iterations)
-            if tb_writer:
-                tb_writer.add_scalar('scene/num_relocated', n_relocated_count, iteration)
-
             # Optimizer step
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
+
+                # Measure the update step before clearing gradients
+                update_step_norm = None
+                if tb_writer and iteration % 1000 == 0 and gaussians._xyz.grad is not None:
+                    update_step_norm = gaussians._xyz.grad.norm(dim=1) * xyz_lr
+
                 gaussians.optimizer.zero_grad(set_to_none = True)
 
             if iteration < opt.iterations:
                 L = build_scaling_rotation(gaussians.get_scaling, gaussians.get_rotation)
                 actual_covariance = L @ L.transpose(1, 2)
+                
+                # Do the noise steering
+                if iteration < opt.iterations:
+                    threshold = None
 
-                def op_sigmoid(x, k=100, x0=0.995):
-                    return 1 / (1 + torch.exp(-k * (x - x0)))
-                
-                def op_linear(x):
-                    mean_val = x.mean()
-                    if mean_val > 1e-6:
-                        return torch.clamp(x / mean_val, 0, 1)
-                    return x
-                
-                if iteration < 25000:
-                    # noise_scale = (op_sigmoid(gaussians.error_contribution) + (op_sigmoid(1- gaussians.get_opacity))) * 0.5
-                    noise_scale = op_sigmoid(1-gaussians.get_opacity)
+                    if opt.noise_guidance == "opacity":
+                        noise_scale = op_sigmoid(1-gaussians.get_opacity, k=100, x0=0.995)
+
+                    elif opt.noise_guidance == "error" and opt.noise_percentile_threshold > 0:
+                        threshold = torch.quantile(gaussians.error_contribution.squeeze(-1), opt.noise_percentile_threshold)
+                        noise_scale = op_sigmoid(gaussians.error_contribution, 100, threshold)
+
+                    elif opt.noise_guidance == "error":
+                        noise_scale = op_sigmoid(gaussians.error_contribution, 100, opt.noise_absolute_threshold)
+
+                    elif opt.noise_guidance == "opacity_error" and opt.noise_percentile_threshold > 0:
+                        threshold = torch.quantile(gaussians.error_contribution.squeeze(-1), opt.noise_percentile_threshold)
+                        noise_scale = op_sigmoid(gaussians.error_contribution, 100, threshold) * op_sigmoid(1 - gaussians.get_opacity, k=100, x0=0.995)
+
+                    elif opt.noise_guidance == "opacity_error":
+                        noise_scale = op_sigmoid(gaussians.error_contribution, 100, opt.noise_absolute_threshold) * op_sigmoid(1 - gaussians.get_opacity, k=100, x0=0.995)
+
+                    elif opt.noise_guidance == "importance":
+                        noise_scale = op_sigmoid(gaussians.importance_score, 1, 0)
+
+                    elif opt.noise_guidance == "importance_opacity":
+                        noise_scale = op_sigmoid(gaussians.error_contribution, 100, 3) * op_sigmoid(gaussians.importance_score, 1, 3)
+
+                    elif opt.noise_guidance == "random":
+                        noise_scale = 1.0
+
+                   
+                    # Log threshold to tensorboard
+                    if tb_writer and threshold is not None:
+                        tb_writer.add_scalar("noise/noise_threshold", threshold.item(), iteration)
+                    
+                    noise_scale *= opt.noise_amplification
                     noise = torch.randn_like(gaussians._xyz) * noise_scale * args.noise_lr * xyz_lr
-                    # noise = torch.randn_like(gaussians._xyz) * (op_sigmoid(1- gaussians.get_opacity))*args.noise_lr*xyz_lr
                     noise = torch.bmm(actual_covariance, noise.unsqueeze(-1)).squeeze(-1)
                     gaussians._xyz.add_(noise)
+
+                    # Log the noise
+                    if tb_writer:
+                        tb_writer.add_scalar("noise/mean", noise.mean().item(), iteration)
+                        tb_writer.add_scalar("noise/min", noise.min().item(), iteration)
+                        tb_writer.add_scalar("noise/max", noise.max().item(), iteration)
+                        if iteration % 1000 == 0:
+                            print(f"[ITER {iteration}] Noise Amp: {opt.noise_amplification}, Noise Scale Max: {noise_scale.max().item()}, Noise Max: {noise.max().item()}")
+                            tb_writer.add_histogram("noise/magnitude", noise.norm(dim=1), iteration)
+                            if update_step_norm is not None:
+                                tb_writer.add_histogram("noise/update_step", update_step_norm, iteration)
+
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
             prev_photometric_loss = float(photometric_loss.item())
+
+
+
+
+
 
 def prepare_output_and_logger(args, use_wandb=True):    
     if not args.model_path:

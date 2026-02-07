@@ -65,6 +65,7 @@ class GaussianModel:
         self.importance_ema = 0.9
         self.error_ema = 0.9
         self.visibility_ema = 0.9
+        self.importance_ema_quantile_top_frac = 0.01
         self.setup_functions()
 
     def capture(self):
@@ -167,6 +168,11 @@ class GaussianModel:
         self.importance_ema = getattr(training_args, "importance_ema", 0.9)
         self.error_ema = getattr(training_args, "error_ema", 0.9)
         self.visibility_ema = getattr(training_args, "visibility_ema", 0.9)
+        self.importance_ema_quantile_top_frac = getattr(
+            training_args,
+            "importance_ema_quantile_top_frac",
+            getattr(training_args, "importance_snapshot_top_frac", 0.01),
+        )
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -480,6 +486,24 @@ class GaussianModel:
         self.importance_snapshot_score.copy_(counts)
         self.importance_snapshot_score[counts < threshold] = 0.0
 
+    def _apply_top_frac(self, values, top_frac):
+        if values.numel() == 0:
+            return values
+        if top_frac <= 0.0:
+            return torch.zeros_like(values)
+        if top_frac >= 1.0:
+            return values
+        k = max(1, int(top_frac * values.numel()))
+        k = min(k, values.numel())
+        topk_vals = torch.topk(values, k=k).values
+        threshold = topk_vals.min()
+        filtered = values.clone()
+        filtered[values < threshold] = 0.0
+        return filtered
+
+    def get_importance_ema_quantile(self):
+        return self._apply_top_frac(self.importance_score, self.importance_ema_quantile_top_frac)
+
     def clear_importance_snapshot(self):
         if self.importance_snapshot_score.numel() != 0:
             self.importance_snapshot_score.zero_()
@@ -581,6 +605,8 @@ class GaussianModel:
                 probs = self.importance_score
             elif self.reloc_sampling == "importance_snapshot":
                 probs = self.importance_snapshot_score
+            elif self.reloc_sampling == "importance_ema_quantile":
+                probs = self.get_importance_ema_quantile()
             elif self.reloc_sampling == "error":
                 probs = self.error_score
             elif self.reloc_sampling == "hybrid":

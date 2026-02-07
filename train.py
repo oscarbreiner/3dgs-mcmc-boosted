@@ -181,6 +181,7 @@ def _all_proxy_values(gaussians, opacity_vals):
     return {
         "importance": gaussians.importance_score,
         "importance_snapshot": gaussians.importance_snapshot_score,
+        "importance_ema_quantile": gaussians.get_importance_ema_quantile(),
         "error": gaussians.error_score,
         "hybrid": opacity_vals * gaussians.importance_score,
         "visibility": gaussians.visibility_score,
@@ -347,6 +348,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             },
             allow_val_change=True,
         )
+        scene_meta = {}
+        if getattr(args, "scene_id", None):
+            scene_meta["scene_id"] = str(args.scene_id)
+        if getattr(args, "scene_type", None):
+            scene_meta["scene_type"] = str(args.scene_type)
+        if scene_meta:
+            wandb.config.update(scene_meta, allow_val_change=True)
+            _mlflow_log_params_safe(scene_meta)
         _mlflow_log_params_safe(
             {
                 "reloc_sampling": args.reloc_sampling,
@@ -423,6 +432,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             wandb.log(corr_log, step=0)
             _mlflow_log_metrics(corr_log, step=0)
 
+    if 0 in testing_iterations:
+        with torch.no_grad():
+            zero = torch.tensor(0.0, device="cuda")
+            training_report(
+                tb_writer,
+                0,
+                zero,
+                zero,
+                l1_loss,
+                0.0,
+                testing_iterations,
+                scene,
+                render,
+                (pipe, background),
+            )
+
     for iteration in range(first_iter, opt.iterations + 1):        
         # if network_gui.conn == None:
         #     network_gui.try_connect()
@@ -467,7 +492,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             with torch.no_grad():
                 gaussians.update_visibility(visibility_filter, ema=args.visibility_ema)
         compute_importance = (
-            args.reloc_sampling in ("importance", "hybrid", "vis_importance", "vis_hybrid")
+            args.reloc_sampling in ("importance", "importance_ema_quantile", "hybrid", "vis_importance", "vis_hybrid")
             or log_proxy_corr_all
         )
         if correlation_analysis:
@@ -679,6 +704,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 elif args.reloc_sampling == "importance_snapshot":
                     proxy_vals = gaussians.importance_snapshot_score
                     proxy_name = "importance_snapshot"
+                elif args.reloc_sampling == "importance_ema_quantile":
+                    proxy_vals = gaussians.get_importance_ema_quantile()
+                    proxy_name = "importance_ema_quantile"
                 elif args.reloc_sampling == "error":
                     proxy_vals = gaussians.error_score
                     proxy_name = "error"
@@ -812,6 +840,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 elif args.reloc_sampling == "importance_snapshot":
                     proxy_vals = gaussians.importance_snapshot_score
                     proxy_name = "importance_snapshot"
+                elif args.reloc_sampling == "importance_ema_quantile":
+                    proxy_vals = gaussians.get_importance_ema_quantile()
+                    proxy_name = "importance_ema_quantile"
                 elif args.reloc_sampling == "error":
                     proxy_vals = gaussians.error_score
                     proxy_name = "error"
@@ -1189,10 +1220,13 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--wandb_project", type=str, default=None)
     parser.add_argument("--wandb_run_name", type=str, default=None)
+    parser.add_argument("--scene_id", type=str, default=None)
+    parser.add_argument("--scene_type", type=str, default=None)
     parser.add_argument("--mlflow", action="store_true", default=False)
     argv = sys.argv[1:]
     args = parser.parse_args(argv)
     
+    config = {}
     if args.config is not None:
         # Load the configuration file
         config = load_config(args.config)
@@ -1201,6 +1235,14 @@ if __name__ == "__main__":
         for key, value in config.items():
             if key not in cli_keys:
                 setattr(args, key, value)
+    else:
+        cli_keys = _get_cli_keys(argv)
+
+    # Default test image logging: every 5k steps, including 0, unless explicitly set.
+    if "test_iterations" not in cli_keys and "test_iterations" not in config:
+        args.test_iterations = list(range(0, int(args.iterations) + 1, 5_000))
+        if not args.test_iterations or args.test_iterations[-1] != int(args.iterations):
+            args.test_iterations.append(int(args.iterations))
 
     args.save_iterations.append(args.iterations)
     

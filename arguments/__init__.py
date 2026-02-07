@@ -56,6 +56,7 @@ class ModelParams(ParamGroup):
         self.eval = False
         self.cap_max = -1
         self.init_type = "random"
+        self.random_init_inside_out = False
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -98,6 +99,7 @@ class OptimizationParams(ParamGroup):
         self.visibility_ema = 0.9
         self.importance_mode = "count"
         self.importance_snapshot_top_frac = 0.01
+        self.importance_ema_quantile_top_frac = 0.01
         self.importance_update_interval = 1
         self.importance_subsample_stride = 1
         self.importance_subsample_ratio = 1.0

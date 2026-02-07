@@ -1,4 +1,4 @@
 {
-    "resolution": 4,
-    "cap_max": 5900000
+    "resolution": 1,
+    "cap_max": 2000000
 }

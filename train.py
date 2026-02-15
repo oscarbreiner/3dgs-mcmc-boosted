@@ -21,6 +21,13 @@ from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
+from utils.noise_steering_utils import (
+    build_error_averager,
+    compute_noise_scale,
+    compute_per_pixel_error_map,
+    normalize_noise_guidance,
+    uses_error_map,
+)
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
@@ -225,6 +232,18 @@ def _subsample_max_id(max_id, stride=1, ratio=1.0):
     scale = float(total) / float(sampled_numel)
     return sampled, scale
 
+def _noise_option(opt, full_args, *names, default=None):
+    for name in names:
+        if hasattr(opt, name):
+            value = getattr(opt, name)
+            if value is not None:
+                return value
+        if hasattr(full_args, name):
+            value = getattr(full_args, name)
+            if value is not None:
+                return value
+    return default
+
 def _append_corr_scatter_rows(
     path,
     iteration,
@@ -298,7 +317,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     use_wandb = WANDB_FOUND
     tb_writer = prepare_output_and_logger(full_args, use_wandb=use_wandb)
     gaussians = GaussianModel(dataset.sh_degree)
-    scene = Scene(dataset, gaussians)
+    noise_error_downscale = max(1, int(getattr(opt, "noise_error_downscale", 2)))
+    resolution_scales = [1.0]
+    if noise_error_downscale > 1:
+        resolution_scales.append(float(noise_error_downscale))
+    scene = Scene(dataset, gaussians, resolution_scales=resolution_scales)
     random_ply_path = getattr(scene.scene_info, "random_ply_path", None)
     gaussians.training_setup(opt)
     log_proxy_corr_all = getattr(args, "log_proxy_corr_all", False)
@@ -393,6 +416,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_end = torch.cuda.Event(enable_timing = True)
 
     viewpoint_stack = None
+    base_cam_list = scene.getTrainCameras()
+    fake_cam_list = (
+        scene.getTrainCameras(scale=float(noise_error_downscale))
+        if noise_error_downscale > 1
+        else base_cam_list
+    )
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -405,6 +434,64 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     psnr_threshold = float(getattr(args, "psnr_threshold", -1.0))
     time_to_threshold_logged = False
     train_start_wall_s = time.time()
+    noise_guidance = normalize_noise_guidance(
+        _noise_option(opt, full_args, "noise_guidance", default="opacity")
+    )
+    noise_percentile_threshold = float(
+        _noise_option(opt, full_args, "noise_percentile_threshold", default=0.0)
+    )
+    noise_absolute_threshold = float(
+        _noise_option(
+            opt,
+            full_args,
+            "noise_absolute_threshold",
+            "noise_error_absolute_threshold",
+            default=0.005,
+        )
+    )
+    noise_error_absolute_threshold = float(
+        _noise_option(
+            opt,
+            full_args,
+            "noise_error_absolute_threshold",
+            "noise_absolute_threshold",
+            default=noise_absolute_threshold,
+        )
+    )
+    noise_amplification = float(
+        _noise_option(opt, full_args, "noise_amplification", default=1.0)
+    )
+    per_pixel_error_metric = str(
+        _noise_option(
+            opt,
+            full_args,
+            "per_pixel_error_metric",
+            "per_piexl_error_metric",
+            default="l1",
+        )
+    ).lower()
+    per_pixel_patch_size = int(
+        _noise_option(opt, full_args, "per_pixel_patch_size", default=1)
+    )
+    avg_mode = _noise_option(
+        opt, full_args, "noise_error_avg_mode", "error_averaging", default="windowed"
+    )
+    avg_window = int(
+        _noise_option(
+            opt,
+            full_args,
+            "noise_error_moving_average_window_size",
+            "moving_average_window_size",
+            default=100,
+        )
+    )
+    avg_ema_decay = float(
+        _noise_option(opt, full_args, "noise_error_ema_decay", "noise_ema", default=0.9)
+    )
+    use_error_guidance = uses_error_map(noise_guidance)
+    error_avg = build_error_averager(avg_mode, window_size=avg_window, ema_decay=avg_ema_decay) if use_error_guidance else None
+    fake_color = None
+    error_contribution = None
 
     if correlation_analysis:
         corr_scatter_path = os.path.join(args.model_path, "correlation_scatter.csv")
@@ -474,10 +561,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Pick a random Camera
         if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
-            viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
-        else:
-            viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+            viewpoint_stack = list(range(len(base_cam_list)))
+        cam_idx = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
+        viewpoint_cam = base_cam_list[cam_idx]
+        fake_viewpoint_cam = fake_cam_list[cam_idx]
 
         # Render
         if (iteration - 1) == debug_from:
@@ -547,6 +634,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
+        fake_loss = None
+        if use_error_guidance:
+            if fake_color is None or fake_color.shape[0] != gaussians.get_xyz.shape[0]:
+                fake_color = torch.zeros_like(gaussians.get_xyz, requires_grad=True, device="cuda")
+                error_contribution = torch.zeros((gaussians.get_xyz.shape[0], 1), device="cuda")
+                if error_avg is not None:
+                    error_avg.reset()
+            black_bg = torch.zeros((3), device="cuda")
+            fake_render = render(fake_viewpoint_cam, gaussians, pipe, black_bg, override_color=fake_color)["render"]
+            # Detach image so fake_loss doesn't keep the main render graph alive.
+            loss_per_pixel = compute_per_pixel_error_map(
+                image.detach(),
+                gt_image,
+                metric=per_pixel_error_metric,
+                patch_size=per_pixel_patch_size,
+            )
+            if fake_render.shape[-2:] != loss_per_pixel.shape:
+                loss_per_pixel = torch.nn.functional.interpolate(
+                    loss_per_pixel.unsqueeze(0).unsqueeze(0),
+                    size=fake_render.shape[-2:],
+                    mode="area",
+                ).squeeze(0).squeeze(0)
+            fake_loss = torch.sum((fake_render * loss_per_pixel).view(-1))
         Ll1 = l1_loss(image, gt_image)
         ssim_val = ssim(image, gt_image)
         train_psnr = psnr(image, gt_image).mean()
@@ -555,8 +665,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         regularization_loss_opacity = args.opacity_reg * torch.abs(gaussians.get_opacity).mean()
         regularization_loss_covariance = args.scale_reg * torch.abs(gaussians.get_scaling).mean()
         loss = photometric_loss + regularization_loss_opacity + regularization_loss_covariance
+        if fake_loss is not None:
+            loss = loss + fake_loss
 
         loss.backward()
+        if use_error_guidance and fake_color is not None and fake_color.grad is not None:
+            with torch.no_grad():
+                current_error = fake_color.grad[:, 0:1]
+                if error_avg is not None:
+                    error_contribution = error_avg.update(current_error)
+                else:
+                    error_contribution = current_error
+                fake_color.grad = None
         if args.reloc_sampling == "error" or log_proxy_corr_all or correlation_analysis:
             if gaussians._opacity.grad is not None:
                 with torch.no_grad():
@@ -909,11 +1029,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration < opt.iterations:
                 L = build_scaling_rotation(gaussians.get_scaling, gaussians.get_rotation)
                 actual_covariance = L @ L.transpose(1, 2)
+                if error_contribution is None or error_contribution.shape[0] != gaussians.get_xyz.shape[0]:
+                    error_contribution = torch.zeros((gaussians.get_xyz.shape[0], 1), device="cuda")
+                noise_scale, noise_threshold = compute_noise_scale(
+                    noise_guidance=noise_guidance,
+                    opacity=gaussians.get_opacity,
+                    importance_score=gaussians.importance_score,
+                    error_contribution=error_contribution,
+                    noise_percentile_threshold=noise_percentile_threshold,
+                    noise_absolute_threshold=noise_absolute_threshold,
+                    noise_error_absolute_threshold=noise_error_absolute_threshold,
+                    noise_amplification=noise_amplification,
+                )
+                if tb_writer and noise_threshold is not None:
+                    tb_writer.add_scalar("noise/noise_threshold", noise_threshold.item(), iteration)
 
-                def op_sigmoid(x, k=100, x0=0.995):
-                    return 1 / (1 + torch.exp(-k * (x - x0)))
-
-                noise = torch.randn_like(gaussians._xyz) * (op_sigmoid(1- gaussians.get_opacity))*args.noise_lr*xyz_lr
+                noise = torch.randn_like(gaussians._xyz) * noise_scale * args.noise_lr * xyz_lr
                 noise = torch.bmm(actual_covariance, noise.unsqueeze(-1)).squeeze(-1)
                 gaussians._xyz.add_(noise)
 
@@ -1223,6 +1354,16 @@ if __name__ == "__main__":
     parser.add_argument("--scene_id", type=str, default=None)
     parser.add_argument("--scene_type", type=str, default=None)
     parser.add_argument("--mlflow", action="store_true", default=False)
+    # Noise steering compatibility options from maxi version.
+    parser.add_argument("--noise_amplification", type=float, default=None)
+    parser.add_argument("--noise_percentile_threshold", type=float, default=None)
+    parser.add_argument("--noise_absolute_threshold", type=float, default=None)
+    parser.add_argument("--error_averaging", type=str, default=None)
+    parser.add_argument("--moving_average_window_size", type=int, default=None)
+    parser.add_argument("--noise_ema", type=float, default=None)
+    parser.add_argument("--per_pixel_error_metric", type=str, default=None)
+    parser.add_argument("--per_piexl_error_metric", type=str, default=None)
+    parser.add_argument("--per_pixel_patch_size", type=int, default=None)
     argv = sys.argv[1:]
     args = parser.parse_args(argv)
     

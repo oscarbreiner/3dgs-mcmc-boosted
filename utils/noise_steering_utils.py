@@ -78,75 +78,63 @@ def compute_per_pixel_error_map(image, gt_image, metric="l1", patch_size=1):
 
 
 def uses_error_map(noise_guidance):
-    guidance = normalize_noise_guidance(noise_guidance)
+    guidance = str(noise_guidance or "opacity").lower()
     return guidance in (
         "error",
-        "opacity_error",
+        "opacity_error_percentile",
         "opacity_error_threshold",
-        "vis_pixel_count_opacity",
     )
 
-
-def normalize_noise_guidance(noise_guidance):
-    guidance = str(noise_guidance or "opacity").lower()
-    aliases = {
-        "opactiy": "opacity",
-        "opacity-error-threshold": "opacity_error_threshold",
-    }
-    return aliases.get(guidance, guidance)
-
-
 def build_error_averager(avg_mode, window_size=100, ema_decay=0.9):
-    mode = str(avg_mode or "windowed").lower()
-    if mode in ("windowed", "moving_average", "ma"):
+    mode = str(avg_mode or "windowed_moving_average").lower()
+    if mode == "windowed_moving_average":
         return WindowedAverage(window_size)
-    if mode in ("ema", "exponential"):
+    if mode == "ema":
         return ExponentialMovingAverage(ema_decay)
-    if mode in ("none", "off", "disabled"):
+    if mode == "none":
         return None
-    return WindowedAverage(window_size)
+    raise ValueError(f"Unknown noise_error_avg_mode '{avg_mode}'")
 
 
 def compute_noise_scale(
     noise_guidance,
     opacity,
-    vis_pixel_count_score,
     error_contribution,
-    noise_percentile_threshold=0.0,
-    noise_absolute_threshold=0.005,
+    noise_error_percentile_threshold=0.0,
     noise_error_absolute_threshold=0.005,
     noise_amplification=1.0,
 ):
-    guidance = normalize_noise_guidance(noise_guidance)
-    threshold = None
+    guidance = str(noise_guidance or "opacity").lower()
+    amplification = float(noise_amplification)
+    percentile_threshold = float(noise_error_percentile_threshold)
+    absolute_threshold = float(noise_error_absolute_threshold)
 
     if guidance == "opacity":
-        noise_scale = sigmoid_guidance(1 - opacity, k=100, x0=0.995)
-    elif guidance == "error" and float(noise_percentile_threshold) > 0:
-        threshold = torch.quantile(error_contribution.squeeze(-1), float(noise_percentile_threshold))
-        noise_scale = sigmoid_guidance(error_contribution, 100, threshold)
-    elif guidance == "error":
-        noise_scale = sigmoid_guidance(error_contribution, 100, float(noise_absolute_threshold))
-    elif guidance == "opacity_error" and float(noise_percentile_threshold) > 0:
-        threshold = torch.quantile(error_contribution.squeeze(-1), float(noise_percentile_threshold))
-        noise_scale = sigmoid_guidance(error_contribution, 100, threshold) * sigmoid_guidance(
-            1 - opacity, k=100, x0=0.995
+        return sigmoid_guidance(1 - opacity, k=100, x0=0.995) * amplification, None
+    if guidance == "error" and percentile_threshold > 0:
+        threshold = torch.quantile(error_contribution.squeeze(-1), percentile_threshold)
+        return sigmoid_guidance(error_contribution, 100, threshold) * amplification, threshold
+    if guidance == "error":
+        return sigmoid_guidance(error_contribution, 100, absolute_threshold) * amplification, None
+    if guidance == "opacity_error_percentile":
+        if percentile_threshold <= 0:
+            raise ValueError(
+                "noise_error_percentile_threshold must be > 0 when noise_guidance='opacity_error_percentile'"
+            )
+        threshold = torch.quantile(error_contribution.squeeze(-1), percentile_threshold)
+        return (
+            sigmoid_guidance(error_contribution, 100, threshold)
+            * sigmoid_guidance(1 - opacity, k=100, x0=0.995)
+            * amplification,
+            threshold,
         )
-    elif guidance == "opacity_error":
-        noise_scale = sigmoid_guidance(error_contribution, 100, float(noise_absolute_threshold)) * sigmoid_guidance(
-            1 - opacity, k=100, x0=0.995
+    if guidance == "opacity_error_threshold":
+        return (
+            sigmoid_guidance(error_contribution, 100, absolute_threshold)
+            * sigmoid_guidance(1 - opacity, k=100, x0=0.995)
+            * amplification,
+            None,
         )
-    elif guidance == "opacity_error_threshold":
-        noise_scale = sigmoid_guidance(
-            error_contribution, 100, float(noise_error_absolute_threshold)
-        ) * sigmoid_guidance(1 - opacity, k=100, x0=0.995)
-    elif guidance == "vis_pixel_count":
-        noise_scale = sigmoid_guidance(vis_pixel_count_score, 1, 0)
-    elif guidance == "vis_pixel_count_opacity":
-        noise_scale = sigmoid_guidance(error_contribution, 100, 3) * sigmoid_guidance(vis_pixel_count_score, 1, 3)
-    elif guidance == "random":
-        noise_scale = 1.0
-    else:
-        noise_scale = sigmoid_guidance(1 - opacity, k=100, x0=0.995)
-
-    return noise_scale * float(noise_amplification), threshold
+    if guidance == "random":
+        return 1.0 * amplification, None
+    raise ValueError(f"Unknown noise guidance '{noise_guidance}' (normalized: '{guidance}')")

@@ -91,11 +91,15 @@ class OptimizationParams(ParamGroup):
         self.random_background = False
         self.noise_lr = 5e5
         self.noise_guidance = "opacity"
+        self.noise_amplification = 1.0
+        self.noise_error_percentile_threshold = 0.0
         self.noise_error_absolute_threshold = 0.005
         self.noise_error_moving_average_window_size = 100
-        self.noise_error_avg_mode = "windowed"
+        self.noise_error_avg_mode = "windowed_moving_average"
         self.noise_error_ema_decay = 0.9
         self.noise_error_downscale = 1
+        self.per_pixel_error_metric = "l1"
+        self.per_pixel_patch_size = 1
         self.scale_reg = 0.01
         self.opacity_reg = 0.01
         self.reloc_sampling = "opacity"

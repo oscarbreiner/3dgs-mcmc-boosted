@@ -5,87 +5,27 @@ from utils.noise_steering_utils import (
     build_error_averager,
     compute_noise_scale,
     compute_per_pixel_error_map,
-    normalize_noise_guidance,
     uses_error_map,
 )
-
-
-def _noise_option(opt, full_args, *names, default=None):
-    for name in names:
-        if hasattr(opt, name):
-            value = getattr(opt, name)
-            if value is not None:
-                return value
-        if hasattr(full_args, name):
-            value = getattr(full_args, name)
-            if value is not None:
-                return value
-    return default
-
 
 def get_noise_error_downscale(opt):
     return max(1, int(getattr(opt, "noise_error_downscale", 1)))
 
 
 class NoiseController:
-    def __init__(self, opt, full_args):
-        self.noise_guidance = normalize_noise_guidance(
-            _noise_option(opt, full_args, "noise_guidance", default="opacity")
-        )
-        self.noise_percentile_threshold = float(
-            _noise_option(opt, full_args, "noise_percentile_threshold", default=0.0)
-        )
-        self.noise_absolute_threshold = float(
-            _noise_option(
-                opt,
-                full_args,
-                "noise_absolute_threshold",
-                "noise_error_absolute_threshold",
-                default=0.005,
-            )
-        )
-        self.noise_error_absolute_threshold = float(
-            _noise_option(
-                opt,
-                full_args,
-                "noise_error_absolute_threshold",
-                "noise_absolute_threshold",
-                default=self.noise_absolute_threshold,
-            )
-        )
-        self.noise_amplification = float(
-            _noise_option(opt, full_args, "noise_amplification", default=1.0)
-        )
-        self.per_pixel_error_metric = str(
-            _noise_option(
-                opt,
-                full_args,
-                "per_pixel_error_metric",
-                "per_piexl_error_metric",
-                default="l1",
-            )
-        ).lower()
-        self.per_pixel_patch_size = int(
-            _noise_option(opt, full_args, "per_pixel_patch_size", default=1)
-        )
-        avg_mode = _noise_option(
-            opt, full_args, "noise_error_avg_mode", "error_averaging", default="windowed"
-        )
-        avg_window = int(
-            _noise_option(
-                opt,
-                full_args,
-                "noise_error_moving_average_window_size",
-                "moving_average_window_size",
-                default=100,
-            )
-        )
-        avg_ema_decay = float(
-            _noise_option(opt, full_args, "noise_error_ema_decay", "noise_ema", default=0.9)
-        )
+    def __init__(self, opt, _full_args=None):
+        self.noise_guidance = str(opt.noise_guidance or "opacity").lower()
+        self.noise_error_percentile_threshold = float(opt.noise_error_percentile_threshold)
+        self.noise_error_absolute_threshold = float(opt.noise_error_absolute_threshold)
+        self.noise_amplification = float(opt.noise_amplification)
+        self.per_pixel_error_metric = str(opt.per_pixel_error_metric).lower()
+        self.per_pixel_patch_size = int(opt.per_pixel_patch_size)
+        avg_mode = opt.noise_error_avg_mode
+        avg_window_size = int(opt.noise_error_moving_average_window_size)
+        avg_ema_decay = float(opt.noise_error_ema_decay)
         self.use_error_guidance = uses_error_map(self.noise_guidance)
         self.error_avg = (
-            build_error_averager(avg_mode, window_size=avg_window, ema_decay=avg_ema_decay)
+            build_error_averager(avg_mode, window_size=avg_window_size, ema_decay=avg_ema_decay)
             if self.use_error_guidance
             else None
         )
@@ -142,10 +82,8 @@ class NoiseController:
         noise_scale, noise_threshold = compute_noise_scale(
             noise_guidance=self.noise_guidance,
             opacity=gaussians.get_opacity,
-            vis_pixel_count_score=gaussians.vis_pixel_count_score,
             error_contribution=self.error_contribution,
-            noise_percentile_threshold=self.noise_percentile_threshold,
-            noise_absolute_threshold=self.noise_absolute_threshold,
+            noise_error_percentile_threshold=self.noise_error_percentile_threshold,
             noise_error_absolute_threshold=self.noise_error_absolute_threshold,
             noise_amplification=self.noise_amplification,
         )

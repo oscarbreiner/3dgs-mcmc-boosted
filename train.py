@@ -699,16 +699,6 @@ if __name__ == "__main__":
     parser.add_argument("--scene_type", type=str, default=None)
     parser.add_argument("--mlflow", action="store_true", default=False)
     parser.add_argument("--logging_level", type=str, default="core")
-    # Noise steering compatibility options from maxi version.
-    parser.add_argument("--noise_amplification", type=float, default=None)
-    parser.add_argument("--noise_percentile_threshold", type=float, default=None)
-    parser.add_argument("--noise_absolute_threshold", type=float, default=None)
-    parser.add_argument("--error_averaging", type=str, default=None)
-    parser.add_argument("--moving_average_window_size", type=int, default=None)
-    parser.add_argument("--noise_ema", type=float, default=None)
-    parser.add_argument("--per_pixel_error_metric", type=str, default=None)
-    parser.add_argument("--per_piexl_error_metric", type=str, default=None)
-    parser.add_argument("--per_pixel_patch_size", type=int, default=None)
     argv = sys.argv[1:]
     args = parser.parse_args(argv)
     

@@ -57,6 +57,15 @@ class GaussianModel:
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+        self.vis_pixel_count_score = torch.empty(0)
+        self.vis_pixel_count_snapshot_score = torch.empty(0)
+        self.error_score = torch.empty(0)
+        self.vis_binary_score = torch.empty(0)
+        self.reloc_sampling = "opacity"
+        self.vis_pixel_count_ema = 0.9
+        self.error_ema = 0.9
+        self.vis_binary_ema = 0.9
+        self.vis_pixel_count_ema_quantile_top_frac = 0.01
         self.setup_functions()
 
     def capture(self):
@@ -151,6 +160,19 @@ class GaussianModel:
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.vis_pixel_count_score = torch.zeros((self.get_xyz.shape[0],), device="cuda")
+        self.vis_pixel_count_snapshot_score = torch.zeros((self.get_xyz.shape[0],), device="cuda")
+        self.error_score = torch.zeros((self.get_xyz.shape[0],), device="cuda")
+        self.vis_binary_score = torch.zeros((self.get_xyz.shape[0],), device="cuda")
+        self.reloc_sampling = getattr(training_args, "reloc_sampling", "opacity")
+        self.vis_pixel_count_ema = getattr(training_args, "vis_pixel_count_ema", 0.9)
+        self.error_ema = getattr(training_args, "error_ema", 0.9)
+        self.vis_binary_ema = getattr(training_args, "vis_binary_ema", 0.9)
+        self.vis_pixel_count_ema_quantile_top_frac = getattr(
+            training_args,
+            "vis_pixel_count_ema_quantile_top_frac",
+            getattr(training_args, "vis_pixel_count_snapshot_top_frac", 0.01),
+        )
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -162,6 +184,7 @@ class GaussianModel:
         ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+        # self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15, capturable=True)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
@@ -304,6 +327,14 @@ class GaussianModel:
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+        if self.vis_pixel_count_score.numel() != 0:
+            self.vis_pixel_count_score = self.vis_pixel_count_score[valid_points_mask]
+        if self.vis_pixel_count_snapshot_score.numel() != 0:
+            self.vis_pixel_count_snapshot_score = self.vis_pixel_count_snapshot_score[valid_points_mask]
+        if self.error_score.numel() != 0:
+            self.error_score = self.error_score[valid_points_mask]
+        if self.vis_binary_score.numel() != 0:
+            self.vis_binary_score = self.vis_binary_score[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -342,6 +373,30 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        if self.vis_pixel_count_score.numel() != 0:
+            new_count = new_xyz.shape[0]
+            self.vis_pixel_count_score = torch.cat(
+                (self.vis_pixel_count_score, torch.zeros((new_count,), device="cuda")),
+                dim=0
+            )
+        if self.vis_pixel_count_snapshot_score.numel() != 0:
+            new_count = new_xyz.shape[0]
+            self.vis_pixel_count_snapshot_score = torch.cat(
+                (self.vis_pixel_count_snapshot_score, torch.zeros((new_count,), device="cuda")),
+                dim=0
+            )
+        if self.error_score.numel() != 0:
+            new_count = new_xyz.shape[0]
+            self.error_score = torch.cat(
+                (self.error_score, torch.zeros((new_count,), device="cuda")),
+                dim=0
+            )
+        if self.vis_binary_score.numel() != 0:
+            new_count = new_xyz.shape[0]
+            self.vis_binary_score = torch.cat(
+                (self.vis_binary_score, torch.zeros((new_count,), device="cuda")),
+                dim=0
+            )
 
         if reset_params:
             self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -408,6 +463,67 @@ class GaussianModel:
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
 
+    def update_vis_pixel_count(self, counts, ema=None):
+        if counts.numel() == 0:
+            return
+        if self.vis_pixel_count_score.numel() != counts.numel():
+            self.vis_pixel_count_score = torch.zeros_like(counts)
+        ema = self.vis_pixel_count_ema if ema is None else ema
+        self.vis_pixel_count_score.mul_(ema).add_(counts * (1.0 - ema))
+
+    def update_vis_pixel_count_snapshot(self, counts, top_frac=0.01):
+        if counts.numel() == 0:
+            return
+        if self.vis_pixel_count_snapshot_score.numel() != counts.numel():
+            self.vis_pixel_count_snapshot_score = torch.zeros_like(counts)
+        if top_frac <= 0.0:
+            self.vis_pixel_count_snapshot_score.zero_()
+            return
+        k = max(1, int(top_frac * counts.numel()))
+        k = min(k, counts.numel())
+        topk_vals = torch.topk(counts, k=k).values
+        threshold = topk_vals.min()
+        self.vis_pixel_count_snapshot_score.copy_(counts)
+        self.vis_pixel_count_snapshot_score[counts < threshold] = 0.0
+
+    def _apply_top_frac(self, values, top_frac):
+        if values.numel() == 0:
+            return values
+        if top_frac <= 0.0:
+            return torch.zeros_like(values)
+        if top_frac >= 1.0:
+            return values
+        k = max(1, int(top_frac * values.numel()))
+        k = min(k, values.numel())
+        topk_vals = torch.topk(values, k=k).values
+        threshold = topk_vals.min()
+        filtered = values.clone()
+        filtered[values < threshold] = 0.0
+        return filtered
+
+    def get_vis_pixel_count_ema_quantile(self):
+        return self._apply_top_frac(self.vis_pixel_count_score, self.vis_pixel_count_ema_quantile_top_frac)
+
+    def clear_vis_pixel_count_snapshot(self):
+        if self.vis_pixel_count_snapshot_score.numel() != 0:
+            self.vis_pixel_count_snapshot_score.zero_()
+
+    def update_error_score(self, scores, ema=None):
+        if scores.numel() == 0:
+            return
+        if self.error_score.numel() != scores.numel():
+            self.error_score = torch.zeros_like(scores)
+        ema = self.error_ema if ema is None else ema
+        self.error_score.mul_(ema).add_(scores * (1.0 - ema))
+
+    def update_vis_binary(self, visible_mask, ema=None):
+        if visible_mask.numel() == 0:
+            return
+        if self.vis_binary_score.numel() != visible_mask.numel():
+            self.vis_binary_score = torch.zeros_like(visible_mask, dtype=torch.float)
+        ema = self.vis_binary_ema if ema is None else ema
+        self.vis_binary_score.mul_(ema).add_(visible_mask.float() * (1.0 - ema))
+
     def replace_tensors_to_optimizer(self, inds=None):
         tensors_dict = {"xyz": self._xyz,
             "f_dc": self._features_dc,
@@ -467,23 +583,68 @@ class GaussianModel:
             sampled_idxs = alive_indices[sampled_idxs]
         ratio = torch.bincount(sampled_idxs).unsqueeze(-1)
         return sampled_idxs, ratio
+
+    def _get_sampling_probs(self, indices=None):
+        eps = torch.finfo(torch.float32).eps
+        if self.reloc_sampling.startswith("vis_binary_"):
+            if self.reloc_sampling == "vis_binary_opacity":
+                base = self.get_opacity.squeeze(-1)
+            elif self.reloc_sampling == "vis_binary_vis_pixel_count":
+                base = self.vis_pixel_count_score
+            elif self.reloc_sampling == "vis_binary_vis_pixel_count_hybrid":
+                base = self.get_opacity.squeeze(-1) * self.vis_pixel_count_score
+            else:
+                base = self.get_opacity.squeeze(-1)
+            probs = base * torch.clamp(self.vis_binary_score, min=eps)
+        else:
+            if self.reloc_sampling == "random":
+                probs = torch.ones_like(self.get_opacity.squeeze(-1))
+            elif self.reloc_sampling == "vis_binary":
+                probs = self.vis_binary_score
+            elif self.reloc_sampling == "vis_pixel_count":
+                probs = self.vis_pixel_count_score
+            elif self.reloc_sampling == "vis_pixel_count_snapshot":
+                probs = self.vis_pixel_count_snapshot_score
+            elif self.reloc_sampling == "vis_pixel_count_ema_quantile":
+                probs = self.get_vis_pixel_count_ema_quantile()
+            elif self.reloc_sampling == "error":
+                probs = self.error_score
+            elif self.reloc_sampling == "vis_pixel_count_hybrid":
+                probs = self.get_opacity.squeeze(-1) * self.vis_pixel_count_score
+            else:
+                probs = self.get_opacity.squeeze(-1)
+
+        if indices is not None:
+            probs = probs[indices]
+
+        if probs.sum() <= torch.finfo(probs.dtype).eps:
+            probs = self.get_opacity.squeeze(-1)
+            if indices is not None:
+                probs = probs[indices]
+
+        return probs
     
 
     def relocate_gs(self, dead_mask=None):
 
         if dead_mask.sum() == 0:
-            return
+            return {"num_relocated": 0, "mean_target_prob": 0.0}
 
         alive_mask = ~dead_mask 
         dead_indices = dead_mask.nonzero(as_tuple=True)[0]
         alive_indices = alive_mask.nonzero(as_tuple=True)[0]
 
         if alive_indices.shape[0] <= 0:
-            return
+            return {"num_relocated": 0, "mean_target_prob": 0.0}
 
-        # sample from alive ones based on opacity
-        probs = (self.get_opacity[alive_indices, 0]) 
+        # sample from alive ones based on configured relocation distribution
+        probs = self._get_sampling_probs(indices=alive_indices)
         reinit_idx, ratio = self._sample_alives(alive_indices=alive_indices, probs=probs, num=dead_indices.shape[0])
+        mean_target_prob = 0.0
+        if probs.numel() > 0:
+            pos = torch.searchsorted(alive_indices, reinit_idx)
+            sampled_probs = probs[pos]
+            mean_target_prob = float(sampled_probs.mean().item())
 
         (
             self._xyz[dead_indices], 
@@ -498,7 +659,8 @@ class GaussianModel:
         self._scaling[reinit_idx] = self._scaling[dead_indices]
 
         self.replace_tensors_to_optimizer(inds=reinit_idx) 
-        
+
+        return {"num_relocated": int(dead_indices.shape[0]), "mean_target_prob": mean_target_prob}
 
     def add_new_gs(self, cap_max):
         current_num_points = self._opacity.shape[0]
@@ -506,10 +668,13 @@ class GaussianModel:
         num_gs = max(0, target_num - current_num_points)
 
         if num_gs <= 0:
-            return 0
+            return {"num_added": 0, "mean_source_prob": 0.0}
 
-        probs = self.get_opacity.squeeze(-1) 
+        probs = self._get_sampling_probs()
         add_idx, ratio = self._sample_alives(probs=probs, num=num_gs)
+        mean_source_prob = 0.0
+        if probs.numel() > 0:
+            mean_source_prob = float(probs[add_idx].mean().item())
 
         (
             new_xyz, 
@@ -526,8 +691,4 @@ class GaussianModel:
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, reset_params=False)
         self.replace_tensors_to_optimizer(inds=add_idx)
 
-        return num_gs
-
-
-
-
+        return {"num_added": int(num_gs), "mean_source_prob": mean_source_prob}

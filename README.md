@@ -86,6 +86,35 @@ Example:
 python train.py --source_path PATH/TO/SCENE --config configs/scene.json --eval
 ```
 
-Notes:
-- MCMC-style training can run from random initialization (depending on config), but convergence and quality still depend on dataset and tuning.
-- This repo focuses on **error-guided exploration** and **visibility-guided relocation** within the MCMC training pipeline.
+## Experiment Tracking
+
+This project supports both **W&B** (recommended for SLURM) and **TensorBoard**.
+
+### W&B Setup (Recommended)
+
+```bash
+# One-time login
+wandb login
+
+# Or set API key in SLURM script
+export WANDB_API_KEY=your_api_key_here
+```
+
+### TensorBoard (Alternative)
+
+```bash
+tensorboard --logdir=output/your_run_directory
+```
+
+Requires SSH port forwarding: `ssh -L 6006:localhost:6006 your_cluster`
+
+### Extended Features (Coming Soon)
+- Structure-aware noise steering with configurable loss signal (L1/SSIM)
+- Aggressive densification strategies
+- Enhanced sparse-view reconstruction
+
+## Recommended Setup
+
+Current best setup in this repo:
+- **Noise steering:** hybrid opacity + error threshold (`--noise_guidance opacity_error_threshold`)
+- **Relocation sampling:** `--reloc_sampling vis_pixel_count`

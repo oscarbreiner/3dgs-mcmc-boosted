@@ -90,8 +90,28 @@ class OptimizationParams(ParamGroup):
         self.densify_grad_threshold = 0.0002
         self.random_background = False
         self.noise_lr = 5e5
+        self.noise_guidance = "opacity"
+        self.noise_error_absolute_threshold = 0.005
+        self.noise_error_moving_average_window_size = 100
+        self.noise_error_avg_mode = "windowed"
+        self.noise_error_ema_decay = 0.9
+        self.noise_error_downscale = 1
         self.scale_reg = 0.01
         self.opacity_reg = 0.01
+        self.reloc_sampling = "opacity"
+        self.vis_pixel_count_ema = 0.9
+        self.error_ema = 0.9
+        self.vis_binary_ema = 0.9
+        self.vis_pixel_count_mode = "count"
+        self.vis_pixel_count_snapshot_top_frac = 0.01
+        self.vis_pixel_count_ema_quantile_top_frac = 0.01
+        self.vis_pixel_count_update_interval = 1
+        self.vis_pixel_count_subsample_stride = 1
+        self.vis_pixel_count_subsample_ratio = 1.0
+        self.log_proxy_corr_all = False
+        self.correlation_analysis = False
+        self.cleanup_random_ply = True
+        self.psnr_threshold = 23.46
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

@@ -55,28 +55,42 @@ if [ "$1" == "worker" ]; then
     # Initialize Log
     echo "Starting 3DGS Experiment Worker on host $(hostname) - $(date)" > "$LOG_FILE"
 
-    # --- Parameters ---
-    NOISE_ABSOLUTE_THRESHOLD=(0.02 0.1 0.5 2 5 10)
+    # # --- Parameters ---
+    # NOISE_ABSOLUTE_THRESHOLDS=(0.001 0.0005 0.0001)
 
-    # --- Training Loop ---
-    for WINDOW_SIZE in "${WINDOW_SIZES[@]}"; do
-        echo "" | tee -a "$LOG_FILE"
-        echo "################################################################" | tee -a "$LOG_FILE"
-        echo "Running test with error threshold: $NOISE_ABSOLUTE_THRESHOLD" | tee -a "$LOG_FILE"
-        echo "################################################################" | tee -a "$LOG_FILE"
+    # # --- Training Loop ---
+    # for THRESHOLD in "${NOISE_ABSOLUTE_THRESHOLDS[@]}"; do
+    #     echo "" | tee -a "$LOG_FILE"
+    #     echo "################################################################" | tee -a "$LOG_FILE"
+    #     echo "Running test with error threshold: $THRESHOLD" | tee -a "$LOG_FILE"
+    #     echo "################################################################" | tee -a "$LOG_FILE"
 
-        OUTPUT_PATH="output/clear/opacity_error_abs_threshold_search${NOISE_ABSOLUTE_THRESHOLD}"
-        echo "Output Path: $OUTPUT_PATH" | tee -a "$LOG_FILE"
+    #     OUTPUT_PATH="output/clean/opacity_error_abs_threshold_search${THRESHOLD}"
+    #     echo "Output Path: $OUTPUT_PATH" | tee -a "$LOG_FILE"
 
-        python train.py \
-            --config configs/bicycle.json \
-            --eval \
-            --noie_absolute_threshold "$NOISE_ABSOLUTE_THRESHOLD" \
-            --model_path "$OUTPUT_PATH" \
-            2>&1 | tee -a "$LOG_FILE"
+    #     python train.py \
+    #         --config configs/bicycle.json \
+    #         --eval \
+    #         --noise_absolute_threshold "$THRESHOLD" \
+    #         --model_path "$OUTPUT_PATH" \
+    #         2>&1 | tee -a "$LOG_FILE"
 
-        echo "Completed experiment for threshold $NOISE_ABSOLUTE_THRESHOLD" | tee -a "$LOG_FILE"
-    done
+    #     echo "Completed experiment for threshold $THRESHOLD" | tee -a "$LOG_FILE"
+    # done
+
+    echo "" | tee -a "$LOG_FILE"
+    echo "################################################################" | tee -a "$LOG_FILE"
+    echo "Running test with error only" | tee -a "$LOG_FILE"
+    echo "################################################################" | tee -a "$LOG_FILE"
+
+    OUTPUT_PATH="output/clean_best/random"
+    echo "Output Path: $OUTPUT_PATH" | tee -a "$LOG_FILE"
+
+    python train.py \
+        --config configs/bicycle.json \
+        --eval \
+        --model_path "$OUTPUT_PATH" \
+        2>&1 | tee -a "$LOG_FILE"
 
     exit 0
 fi

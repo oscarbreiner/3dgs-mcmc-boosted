@@ -108,7 +108,7 @@ class OptimizationParams(ParamGroup):
         self.noise_ema = 0.9
         self.moving_average_window_size = 50
         self.per_pixel_patch_size = 1
-        self.noise_guidance = "opacity"
+        self.noise_guidance = "opacity_error"
         self.noise_percentile_threshold = -1
         self.noise_absolute_threshold = 0.02
         self.noise_amplification = 1.0

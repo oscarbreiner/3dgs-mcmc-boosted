@@ -245,11 +245,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Chose the desired per pixel loss
         if opt.per_pixel_error_metric == "l1" and opt.per_pixel_patch_size == 1:
-            loss_per_pixel = l1_loss_per_pixel(image, gt_image)
-        elif opt.per_piexl_error_metric == "l1" and opt.per_pixel_patch_size > 1:
-            loss_per_pixel = windowed_l1_per_pixel(image, gt_image, opt.per_pixel_patch_size)
+            loss_per_pixel = l1_loss_per_pixel(image.detach(), gt_image)
+        elif opt.per_pixel_error_metric == "l1" and opt.per_pixel_patch_size > 1:
+            loss_per_pixel = windowed_l1_per_pixel(image.detach(), gt_image, opt.per_pixel_patch_size)
         elif opt.per_pixel_error_metric == "psnr":
-            loss_per_pixel = psnr_per_pixel(image, gt_image, opt.per_pixel_patch_size)
+            loss_per_pixel = psnr_per_pixel(image.detach(), gt_image, opt.per_pixel_patch_size)
 
         fake_loss = torch.sum((fake_render * loss_per_pixel).view(-1))  # Weight fake_render by per-pixel L1 loss
 

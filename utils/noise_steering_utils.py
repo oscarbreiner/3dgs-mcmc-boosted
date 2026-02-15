@@ -83,7 +83,7 @@ def uses_error_map(noise_guidance):
         "error",
         "opacity_error",
         "opacity_error_threshold",
-        "importance_opacity",
+        "vis_pixel_count_opacity",
     )
 
 
@@ -110,7 +110,7 @@ def build_error_averager(avg_mode, window_size=100, ema_decay=0.9):
 def compute_noise_scale(
     noise_guidance,
     opacity,
-    importance_score,
+    vis_pixel_count_score,
     error_contribution,
     noise_percentile_threshold=0.0,
     noise_absolute_threshold=0.005,
@@ -140,10 +140,10 @@ def compute_noise_scale(
         noise_scale = sigmoid_guidance(
             error_contribution, 100, float(noise_error_absolute_threshold)
         ) * sigmoid_guidance(1 - opacity, k=100, x0=0.995)
-    elif guidance == "importance":
-        noise_scale = sigmoid_guidance(importance_score, 1, 0)
-    elif guidance == "importance_opacity":
-        noise_scale = sigmoid_guidance(error_contribution, 100, 3) * sigmoid_guidance(importance_score, 1, 3)
+    elif guidance == "vis_pixel_count":
+        noise_scale = sigmoid_guidance(vis_pixel_count_score, 1, 0)
+    elif guidance == "vis_pixel_count_opacity":
+        noise_scale = sigmoid_guidance(error_contribution, 100, 3) * sigmoid_guidance(vis_pixel_count_score, 1, 3)
     elif guidance == "random":
         noise_scale = 1.0
     else:

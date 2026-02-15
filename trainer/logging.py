@@ -178,17 +178,17 @@ def proxy_stats(proxy_vals, opacity_vals):
 
 def all_proxy_values(gaussians, opacity_vals):
     eps = torch.finfo(opacity_vals.dtype).eps
-    visibility = torch.clamp(gaussians.visibility_score.to(dtype=opacity_vals.dtype), min=eps)
+    vis_binary = torch.clamp(gaussians.vis_binary_score.to(dtype=opacity_vals.dtype), min=eps)
     return {
-        "importance": gaussians.importance_score,
-        "importance_snapshot": gaussians.importance_snapshot_score,
-        "importance_ema_quantile": gaussians.get_importance_ema_quantile(),
+        "vis_pixel_count": gaussians.vis_pixel_count_score,
+        "vis_pixel_count_snapshot": gaussians.vis_pixel_count_snapshot_score,
+        "vis_pixel_count_ema_quantile": gaussians.get_vis_pixel_count_ema_quantile(),
         "error": gaussians.error_score,
-        "hybrid": opacity_vals * gaussians.importance_score,
-        "visibility": gaussians.visibility_score,
-        "vis_opacity": opacity_vals * visibility,
-        "vis_importance": gaussians.importance_score * visibility,
-        "vis_hybrid": opacity_vals * gaussians.importance_score * visibility,
+        "vis_pixel_count_hybrid": opacity_vals * gaussians.vis_pixel_count_score,
+        "vis_binary": gaussians.vis_binary_score,
+        "vis_binary_opacity": opacity_vals * vis_binary,
+        "vis_binary_vis_pixel_count": gaussians.vis_pixel_count_score * vis_binary,
+        "vis_binary_vis_pixel_count_hybrid": opacity_vals * gaussians.vis_pixel_count_score * vis_binary,
     }
 
 
@@ -205,8 +205,8 @@ def append_corr_scatter_rows(
     path,
     iteration,
     gaussians,
-    raw_visibility=None,
-    raw_importance=None,
+    raw_vis_binary=None,
+    raw_vis_pixel_count=None,
     sample_frac=0.01,
 ):
     opacity = gaussians.get_opacity.squeeze(-1)
@@ -223,22 +223,22 @@ def append_corr_scatter_rows(
             return None
         return tensor[idx]
 
-    importance = _safe_gather(gaussians.importance_score)
-    visibility = _safe_gather(gaussians.visibility_score)
+    vis_pixel_count = _safe_gather(gaussians.vis_pixel_count_score)
+    vis_binary = _safe_gather(gaussians.vis_binary_score)
     error = _safe_gather(gaussians.error_score)
-    raw_visibility = _safe_gather(raw_visibility)
-    raw_importance = _safe_gather(raw_importance)
+    raw_vis_binary = _safe_gather(raw_vis_binary)
+    raw_vis_pixel_count = _safe_gather(raw_vis_pixel_count)
 
     opacity_cpu = opacity[idx].detach().cpu().numpy()
-    importance_cpu = importance.detach().cpu().numpy()
-    visibility_cpu = visibility.detach().cpu().numpy()
+    vis_pixel_count_cpu = vis_pixel_count.detach().cpu().numpy()
+    vis_binary_cpu = vis_binary.detach().cpu().numpy()
     error_cpu = error.detach().cpu().numpy()
-    raw_visibility_cpu = raw_visibility.detach().cpu().numpy()
-    raw_importance_cpu = raw_importance.detach().cpu().numpy()
+    raw_vis_binary_cpu = raw_vis_binary.detach().cpu().numpy()
+    raw_vis_pixel_count_cpu = raw_vis_pixel_count.detach().cpu().numpy()
     idx_cpu = idx.detach().cpu().numpy()
 
     expected_header = (
-        "step,gaussian_idx,opacity,importance,visibility,error,raw_importance,raw_visibility\n"
+        "step,gaussian_idx,opacity,vis_pixel_count,vis_binary,error,raw_vis_pixel_count,raw_vis_binary\n"
     )
     header_needed = not os.path.exists(path)
     if not header_needed:
@@ -257,11 +257,11 @@ def append_corr_scatter_rows(
                     int(iteration),
                     int(idx_cpu[i]),
                     float(opacity_cpu[i]),
-                    float(importance_cpu[i]),
-                    float(visibility_cpu[i]),
+                    float(vis_pixel_count_cpu[i]),
+                    float(vis_binary_cpu[i]),
                     float(error_cpu[i]),
-                    float(raw_importance_cpu[i]),
-                    float(raw_visibility_cpu[i]),
+                    float(raw_vis_pixel_count_cpu[i]),
+                    float(raw_vis_binary_cpu[i]),
                 )
             )
     return path
@@ -311,15 +311,15 @@ def prepare_output_and_logger(args, use_wandb=True):
                     mlflow_set_tag_safe("wandb_run_name", wandb.run.name)
                 if wandb.run.name:
                     reloc_name = getattr(args, "reloc_sampling", "opacity")
-                    importance_ema = getattr(args, "importance_ema", None)
+                    vis_pixel_count_ema = getattr(args, "vis_pixel_count_ema", None)
                     error_ema = getattr(args, "error_ema", None)
                     ema_tag = ""
-                    if reloc_name == "importance" and importance_ema is not None:
-                        ema_tag = "-ema{}".format(importance_ema)
+                    if reloc_name == "vis_pixel_count" and vis_pixel_count_ema is not None:
+                        ema_tag = "-ema{}".format(vis_pixel_count_ema)
                     elif reloc_name == "error" and error_ema is not None:
                         ema_tag = "-ema{}".format(error_ema)
-                    elif reloc_name == "hybrid" and importance_ema is not None and error_ema is not None:
-                        ema_tag = "-ema{}-{}".format(importance_ema, error_ema)
+                    elif reloc_name == "vis_pixel_count_hybrid" and vis_pixel_count_ema is not None and error_ema is not None:
+                        ema_tag = "-ema{}-{}".format(vis_pixel_count_ema, error_ema)
                     cap_max = int(getattr(args, "cap_max", -1))
                     wandb.run.name = "{}{}-cap{}-{}".format(reloc_name, ema_tag, cap_max, wandb.run.name)
                     print("W&B run name: {}".format(wandb.run.name))

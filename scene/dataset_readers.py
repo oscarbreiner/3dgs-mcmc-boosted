@@ -130,21 +130,11 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def _sample_random_points(nerf_normalization, num_pts, inside_out=False):
+def _sample_random_points(nerf_normalization, num_pts):
     radius = float(nerf_normalization["radius"])
-    if not inside_out:
-        return np.random.random((num_pts, 3)) * (radius * 6.0) - (radius * 3.0)
+    return np.random.random((num_pts, 3)) * (radius * 6.0) - (radius * 3.0)
 
-    # Inside-out adaptation: sample inside a sphere centered at camera centroid.
-    center = -np.asarray(nerf_normalization["translate"], dtype=np.float32)
-    dirs = np.random.normal(size=(num_pts, 3)).astype(np.float32)
-    norms = np.linalg.norm(dirs, axis=1, keepdims=True)
-    norms = np.maximum(norms, 1e-8)
-    dirs = dirs / norms
-    radii = (np.random.random((num_pts, 1)).astype(np.float32) ** (1.0 / 3.0)) * radius
-    return center[None, :] + dirs * radii
-
-def readColmapSceneInfo(path, images, eval, llffhold=8, init_type="sfm", num_pts=100000, random_init_inside_out=False):
+def readColmapSceneInfo(path, images, eval, llffhold=8, init_type="sfm", num_pts=100000):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -185,13 +175,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, init_type="sfm", num_pts
         run_tag = os.environ.get("SLURM_JOB_ID") or str(os.getpid())
         ply_path = os.path.join(path, "random_{}.ply".format(run_tag))
         print(f"Generating random point cloud ({num_pts})...")
-        if random_init_inside_out:
-            print("Using inside-out random init adaptation.")
-        xyz = _sample_random_points(
-            nerf_normalization,
-            num_pts=num_pts,
-            inside_out=random_init_inside_out,
-        )
+        xyz = _sample_random_points(nerf_normalization, num_pts=num_pts)
         
         num_pts = xyz.shape[0]
         shs = np.random.random((num_pts, 3)) / 255.0
@@ -371,7 +355,7 @@ def readNerfstudioSceneInfo(path, transforms_path, images_dir, white_background,
                            random_ply_path=None)
     return scene_info
 
-def readScanNetPPSceneInfo(path, images, eval, white_background, init_type="random", num_pts=100000, random_init_inside_out=False):
+def readScanNetPPSceneInfo(path, images, eval, white_background, init_type="random", num_pts=100000):
     images = images or "images"
     images = images.strip()
 
@@ -424,13 +408,7 @@ def readScanNetPPSceneInfo(path, images, eval, white_background, init_type="rand
         run_tag = os.environ.get("SLURM_JOB_ID") or str(os.getpid())
         ply_path = os.path.join(path, "random_{}.ply".format(run_tag))
         print(f"Generating random point cloud ({num_pts})...")
-        if random_init_inside_out:
-            print("Using inside-out random init adaptation.")
-        xyz = _sample_random_points(
-            scene_info.nerf_normalization,
-            num_pts=num_pts,
-            inside_out=random_init_inside_out,
-        )
+        xyz = _sample_random_points(scene_info.nerf_normalization, num_pts=num_pts)
         num_pts = xyz.shape[0]
         shs = np.random.random((num_pts, 3)) / 255.0
         pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))

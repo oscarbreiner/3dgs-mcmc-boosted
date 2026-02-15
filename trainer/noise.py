@@ -142,7 +142,7 @@ class NoiseController:
         noise_scale, noise_threshold = compute_noise_scale(
             noise_guidance=self.noise_guidance,
             opacity=gaussians.get_opacity,
-            importance_score=gaussians.importance_score,
+            vis_pixel_count_score=gaussians.vis_pixel_count_score,
             error_contribution=self.error_contribution,
             noise_percentile_threshold=self.noise_percentile_threshold,
             noise_absolute_threshold=self.noise_absolute_threshold,

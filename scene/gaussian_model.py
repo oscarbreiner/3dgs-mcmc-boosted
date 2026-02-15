@@ -57,15 +57,15 @@ class GaussianModel:
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
-        self.importance_score = torch.empty(0)
-        self.importance_snapshot_score = torch.empty(0)
+        self.vis_pixel_count_score = torch.empty(0)
+        self.vis_pixel_count_snapshot_score = torch.empty(0)
         self.error_score = torch.empty(0)
-        self.visibility_score = torch.empty(0)
+        self.vis_binary_score = torch.empty(0)
         self.reloc_sampling = "opacity"
-        self.importance_ema = 0.9
+        self.vis_pixel_count_ema = 0.9
         self.error_ema = 0.9
-        self.visibility_ema = 0.9
-        self.importance_ema_quantile_top_frac = 0.01
+        self.vis_binary_ema = 0.9
+        self.vis_pixel_count_ema_quantile_top_frac = 0.01
         self.setup_functions()
 
     def capture(self):
@@ -160,18 +160,18 @@ class GaussianModel:
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.importance_score = torch.zeros((self.get_xyz.shape[0],), device="cuda")
-        self.importance_snapshot_score = torch.zeros((self.get_xyz.shape[0],), device="cuda")
+        self.vis_pixel_count_score = torch.zeros((self.get_xyz.shape[0],), device="cuda")
+        self.vis_pixel_count_snapshot_score = torch.zeros((self.get_xyz.shape[0],), device="cuda")
         self.error_score = torch.zeros((self.get_xyz.shape[0],), device="cuda")
-        self.visibility_score = torch.zeros((self.get_xyz.shape[0],), device="cuda")
+        self.vis_binary_score = torch.zeros((self.get_xyz.shape[0],), device="cuda")
         self.reloc_sampling = getattr(training_args, "reloc_sampling", "opacity")
-        self.importance_ema = getattr(training_args, "importance_ema", 0.9)
+        self.vis_pixel_count_ema = getattr(training_args, "vis_pixel_count_ema", 0.9)
         self.error_ema = getattr(training_args, "error_ema", 0.9)
-        self.visibility_ema = getattr(training_args, "visibility_ema", 0.9)
-        self.importance_ema_quantile_top_frac = getattr(
+        self.vis_binary_ema = getattr(training_args, "vis_binary_ema", 0.9)
+        self.vis_pixel_count_ema_quantile_top_frac = getattr(
             training_args,
-            "importance_ema_quantile_top_frac",
-            getattr(training_args, "importance_snapshot_top_frac", 0.01),
+            "vis_pixel_count_ema_quantile_top_frac",
+            getattr(training_args, "vis_pixel_count_snapshot_top_frac", 0.01),
         )
 
         l = [
@@ -327,14 +327,14 @@ class GaussianModel:
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
-        if self.importance_score.numel() != 0:
-            self.importance_score = self.importance_score[valid_points_mask]
-        if self.importance_snapshot_score.numel() != 0:
-            self.importance_snapshot_score = self.importance_snapshot_score[valid_points_mask]
+        if self.vis_pixel_count_score.numel() != 0:
+            self.vis_pixel_count_score = self.vis_pixel_count_score[valid_points_mask]
+        if self.vis_pixel_count_snapshot_score.numel() != 0:
+            self.vis_pixel_count_snapshot_score = self.vis_pixel_count_snapshot_score[valid_points_mask]
         if self.error_score.numel() != 0:
             self.error_score = self.error_score[valid_points_mask]
-        if self.visibility_score.numel() != 0:
-            self.visibility_score = self.visibility_score[valid_points_mask]
+        if self.vis_binary_score.numel() != 0:
+            self.vis_binary_score = self.vis_binary_score[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -373,16 +373,16 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
-        if self.importance_score.numel() != 0:
+        if self.vis_pixel_count_score.numel() != 0:
             new_count = new_xyz.shape[0]
-            self.importance_score = torch.cat(
-                (self.importance_score, torch.zeros((new_count,), device="cuda")),
+            self.vis_pixel_count_score = torch.cat(
+                (self.vis_pixel_count_score, torch.zeros((new_count,), device="cuda")),
                 dim=0
             )
-        if self.importance_snapshot_score.numel() != 0:
+        if self.vis_pixel_count_snapshot_score.numel() != 0:
             new_count = new_xyz.shape[0]
-            self.importance_snapshot_score = torch.cat(
-                (self.importance_snapshot_score, torch.zeros((new_count,), device="cuda")),
+            self.vis_pixel_count_snapshot_score = torch.cat(
+                (self.vis_pixel_count_snapshot_score, torch.zeros((new_count,), device="cuda")),
                 dim=0
             )
         if self.error_score.numel() != 0:
@@ -391,10 +391,10 @@ class GaussianModel:
                 (self.error_score, torch.zeros((new_count,), device="cuda")),
                 dim=0
             )
-        if self.visibility_score.numel() != 0:
+        if self.vis_binary_score.numel() != 0:
             new_count = new_xyz.shape[0]
-            self.visibility_score = torch.cat(
-                (self.visibility_score, torch.zeros((new_count,), device="cuda")),
+            self.vis_binary_score = torch.cat(
+                (self.vis_binary_score, torch.zeros((new_count,), device="cuda")),
                 dim=0
             )
 
@@ -463,28 +463,28 @@ class GaussianModel:
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
 
-    def update_importance(self, counts, ema=None):
+    def update_vis_pixel_count(self, counts, ema=None):
         if counts.numel() == 0:
             return
-        if self.importance_score.numel() != counts.numel():
-            self.importance_score = torch.zeros_like(counts)
-        ema = self.importance_ema if ema is None else ema
-        self.importance_score.mul_(ema).add_(counts * (1.0 - ema))
+        if self.vis_pixel_count_score.numel() != counts.numel():
+            self.vis_pixel_count_score = torch.zeros_like(counts)
+        ema = self.vis_pixel_count_ema if ema is None else ema
+        self.vis_pixel_count_score.mul_(ema).add_(counts * (1.0 - ema))
 
-    def update_importance_snapshot(self, counts, top_frac=0.01):
+    def update_vis_pixel_count_snapshot(self, counts, top_frac=0.01):
         if counts.numel() == 0:
             return
-        if self.importance_snapshot_score.numel() != counts.numel():
-            self.importance_snapshot_score = torch.zeros_like(counts)
+        if self.vis_pixel_count_snapshot_score.numel() != counts.numel():
+            self.vis_pixel_count_snapshot_score = torch.zeros_like(counts)
         if top_frac <= 0.0:
-            self.importance_snapshot_score.zero_()
+            self.vis_pixel_count_snapshot_score.zero_()
             return
         k = max(1, int(top_frac * counts.numel()))
         k = min(k, counts.numel())
         topk_vals = torch.topk(counts, k=k).values
         threshold = topk_vals.min()
-        self.importance_snapshot_score.copy_(counts)
-        self.importance_snapshot_score[counts < threshold] = 0.0
+        self.vis_pixel_count_snapshot_score.copy_(counts)
+        self.vis_pixel_count_snapshot_score[counts < threshold] = 0.0
 
     def _apply_top_frac(self, values, top_frac):
         if values.numel() == 0:
@@ -501,14 +501,14 @@ class GaussianModel:
         filtered[values < threshold] = 0.0
         return filtered
 
-    def get_importance_ema_quantile(self):
-        return self._apply_top_frac(self.importance_score, self.importance_ema_quantile_top_frac)
+    def get_vis_pixel_count_ema_quantile(self):
+        return self._apply_top_frac(self.vis_pixel_count_score, self.vis_pixel_count_ema_quantile_top_frac)
 
-    def clear_importance_snapshot(self):
-        if self.importance_snapshot_score.numel() != 0:
-            self.importance_snapshot_score.zero_()
+    def clear_vis_pixel_count_snapshot(self):
+        if self.vis_pixel_count_snapshot_score.numel() != 0:
+            self.vis_pixel_count_snapshot_score.zero_()
 
-    def update_error_importance(self, scores, ema=None):
+    def update_error_score(self, scores, ema=None):
         if scores.numel() == 0:
             return
         if self.error_score.numel() != scores.numel():
@@ -516,13 +516,13 @@ class GaussianModel:
         ema = self.error_ema if ema is None else ema
         self.error_score.mul_(ema).add_(scores * (1.0 - ema))
 
-    def update_visibility(self, visible_mask, ema=None):
+    def update_vis_binary(self, visible_mask, ema=None):
         if visible_mask.numel() == 0:
             return
-        if self.visibility_score.numel() != visible_mask.numel():
-            self.visibility_score = torch.zeros_like(visible_mask, dtype=torch.float)
-        ema = self.visibility_ema if ema is None else ema
-        self.visibility_score.mul_(ema).add_(visible_mask.float() * (1.0 - ema))
+        if self.vis_binary_score.numel() != visible_mask.numel():
+            self.vis_binary_score = torch.zeros_like(visible_mask, dtype=torch.float)
+        ema = self.vis_binary_ema if ema is None else ema
+        self.vis_binary_score.mul_(ema).add_(visible_mask.float() * (1.0 - ema))
 
     def replace_tensors_to_optimizer(self, inds=None):
         tensors_dict = {"xyz": self._xyz,
@@ -586,31 +586,31 @@ class GaussianModel:
 
     def _get_sampling_probs(self, indices=None):
         eps = torch.finfo(torch.float32).eps
-        if self.reloc_sampling.startswith("vis_"):
-            if self.reloc_sampling == "vis_opacity":
+        if self.reloc_sampling.startswith("vis_binary_"):
+            if self.reloc_sampling == "vis_binary_opacity":
                 base = self.get_opacity.squeeze(-1)
-            elif self.reloc_sampling == "vis_importance":
-                base = self.importance_score
-            elif self.reloc_sampling == "vis_hybrid":
-                base = self.get_opacity.squeeze(-1) * self.importance_score
+            elif self.reloc_sampling == "vis_binary_vis_pixel_count":
+                base = self.vis_pixel_count_score
+            elif self.reloc_sampling == "vis_binary_vis_pixel_count_hybrid":
+                base = self.get_opacity.squeeze(-1) * self.vis_pixel_count_score
             else:
                 base = self.get_opacity.squeeze(-1)
-            probs = base * torch.clamp(self.visibility_score, min=eps)
+            probs = base * torch.clamp(self.vis_binary_score, min=eps)
         else:
             if self.reloc_sampling == "random":
                 probs = torch.ones_like(self.get_opacity.squeeze(-1))
-            elif self.reloc_sampling == "visibility":
-                probs = self.visibility_score
-            elif self.reloc_sampling == "importance":
-                probs = self.importance_score
-            elif self.reloc_sampling == "importance_snapshot":
-                probs = self.importance_snapshot_score
-            elif self.reloc_sampling == "importance_ema_quantile":
-                probs = self.get_importance_ema_quantile()
+            elif self.reloc_sampling == "vis_binary":
+                probs = self.vis_binary_score
+            elif self.reloc_sampling == "vis_pixel_count":
+                probs = self.vis_pixel_count_score
+            elif self.reloc_sampling == "vis_pixel_count_snapshot":
+                probs = self.vis_pixel_count_snapshot_score
+            elif self.reloc_sampling == "vis_pixel_count_ema_quantile":
+                probs = self.get_vis_pixel_count_ema_quantile()
             elif self.reloc_sampling == "error":
                 probs = self.error_score
-            elif self.reloc_sampling == "hybrid":
-                probs = self.get_opacity.squeeze(-1) * self.importance_score
+            elif self.reloc_sampling == "vis_pixel_count_hybrid":
+                probs = self.get_opacity.squeeze(-1) * self.vis_pixel_count_score
             else:
                 probs = self.get_opacity.squeeze(-1)
 

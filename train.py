@@ -78,14 +78,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     corr_scatter_path = None
     corr_log_interval = 300
     print(
-        "[Reloc] sampling={}, importance_ema={}, error_ema={}, importance_snapshot_top_frac={}, importance_update_interval={}, importance_subsample_stride={}, importance_subsample_ratio={}, log_proxy_corr_all={}, correlation_analysis={}".format(
+        "[Reloc] sampling={}, vis_pixel_count_ema={}, error_ema={}, vis_pixel_count_snapshot_top_frac={}, vis_pixel_count_update_interval={}, vis_pixel_count_subsample_stride={}, vis_pixel_count_subsample_ratio={}, log_proxy_corr_all={}, correlation_analysis={}".format(
             args.reloc_sampling,
-            args.importance_ema,
+            args.vis_pixel_count_ema,
             args.error_ema,
-            args.importance_snapshot_top_frac,
-            getattr(args, "importance_update_interval", 1),
-            getattr(args, "importance_subsample_stride", 1),
-            getattr(args, "importance_subsample_ratio", 1.0),
+            args.vis_pixel_count_snapshot_top_frac,
+            getattr(args, "vis_pixel_count_update_interval", 1),
+            getattr(args, "vis_pixel_count_subsample_stride", 1),
+            getattr(args, "vis_pixel_count_subsample_ratio", 1.0),
             log_proxy_corr_all,
             correlation_analysis,
         )
@@ -93,14 +93,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if tb_writer:
         tb_writer.add_text(
             "hparams/reloc_sampling",
-            "sampling={}, importance_ema={}, error_ema={}, importance_snapshot_top_frac={}, importance_update_interval={}, importance_subsample_stride={}, importance_subsample_ratio={}, log_proxy_corr_all={}, correlation_analysis={}".format(
+            "sampling={}, vis_pixel_count_ema={}, error_ema={}, vis_pixel_count_snapshot_top_frac={}, vis_pixel_count_update_interval={}, vis_pixel_count_subsample_stride={}, vis_pixel_count_subsample_ratio={}, log_proxy_corr_all={}, correlation_analysis={}".format(
                 args.reloc_sampling,
-                args.importance_ema,
+                args.vis_pixel_count_ema,
                 args.error_ema,
-                args.importance_snapshot_top_frac,
-                getattr(args, "importance_update_interval", 1),
-                getattr(args, "importance_subsample_stride", 1),
-                getattr(args, "importance_subsample_ratio", 1.0),
+                args.vis_pixel_count_snapshot_top_frac,
+                getattr(args, "vis_pixel_count_update_interval", 1),
+                getattr(args, "vis_pixel_count_subsample_stride", 1),
+                getattr(args, "vis_pixel_count_subsample_ratio", 1.0),
                 log_proxy_corr_all,
                 correlation_analysis,
             ),
@@ -109,12 +109,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         wandb.config.update(
             {
                 "reloc_sampling": args.reloc_sampling,
-                "importance_ema": args.importance_ema,
+                "vis_pixel_count_ema": args.vis_pixel_count_ema,
                 "error_ema": args.error_ema,
-                "importance_snapshot_top_frac": args.importance_snapshot_top_frac,
-                "importance_update_interval": getattr(args, "importance_update_interval", 1),
-                "importance_subsample_stride": getattr(args, "importance_subsample_stride", 1),
-                "importance_subsample_ratio": getattr(args, "importance_subsample_ratio", 1.0),
+                "vis_pixel_count_snapshot_top_frac": args.vis_pixel_count_snapshot_top_frac,
+                "vis_pixel_count_update_interval": getattr(args, "vis_pixel_count_update_interval", 1),
+                "vis_pixel_count_subsample_stride": getattr(args, "vis_pixel_count_subsample_stride", 1),
+                "vis_pixel_count_subsample_ratio": getattr(args, "vis_pixel_count_subsample_ratio", 1.0),
                 "log_proxy_corr_all": log_proxy_corr_all,
                 "correlation_analysis": correlation_analysis,
             },
@@ -131,12 +131,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         train_logging.mlflow_log_params_safe(
             {
                 "reloc_sampling": args.reloc_sampling,
-                "importance_ema": args.importance_ema,
+                "vis_pixel_count_ema": args.vis_pixel_count_ema,
                 "error_ema": args.error_ema,
-                "importance_snapshot_top_frac": args.importance_snapshot_top_frac,
-                "importance_update_interval": getattr(args, "importance_update_interval", 1),
-                "importance_subsample_stride": getattr(args, "importance_subsample_stride", 1),
-                "importance_subsample_ratio": getattr(args, "importance_subsample_ratio", 1.0),
+                "vis_pixel_count_snapshot_top_frac": args.vis_pixel_count_snapshot_top_frac,
+                "vis_pixel_count_update_interval": getattr(args, "vis_pixel_count_update_interval", 1),
+                "vis_pixel_count_subsample_stride": getattr(args, "vis_pixel_count_subsample_stride", 1),
+                "vis_pixel_count_subsample_ratio": getattr(args, "vis_pixel_count_subsample_ratio", 1.0),
                 "log_proxy_corr_all": log_proxy_corr_all,
                 "correlation_analysis": correlation_analysis,
             }
@@ -163,7 +163,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter += 1
     proxy_log_interval = max(1, opt.densification_interval)
     proxy_scatter_interval = 10000
-    importance_update_interval = max(1, int(getattr(args, "importance_update_interval", 1)))
+    vis_pixel_count_update_interval = max(1, int(getattr(args, "vis_pixel_count_update_interval", 1)))
     prev_photometric_loss = None
     pending_reloc_prev_loss = None
     pending_reloc_iter = None
@@ -187,8 +187,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             opacity_vals = gaussians.get_opacity.squeeze(-1)
             corr_sources = {
                 "opacity": opacity_vals,
-                "importance": gaussians.importance_score,
-                "visibility": gaussians.visibility_score,
+                "vis_pixel_count": gaussians.vis_pixel_count_score,
+                "vis_binary": gaussians.vis_binary_score,
             }
             corr_log = {}
             for a_name, a_vals in corr_sources.items():
@@ -260,25 +260,32 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         visibility_filter = render_pkg.get("visibility_filter")
         if visibility_filter is not None and visibility_filter.numel() == gaussians.get_xyz.shape[0]:
             with torch.no_grad():
-                gaussians.update_visibility(visibility_filter, ema=args.visibility_ema)
-        compute_importance = (
-            args.reloc_sampling in ("importance", "importance_ema_quantile", "hybrid", "vis_importance", "vis_hybrid")
+                gaussians.update_vis_binary(visibility_filter, ema=args.vis_binary_ema)
+        compute_vis_pixel_count = (
+            args.reloc_sampling
+            in (
+                "vis_pixel_count",
+                "vis_pixel_count_ema_quantile",
+                "vis_pixel_count_hybrid",
+                "vis_binary_vis_pixel_count",
+                "vis_binary_vis_pixel_count_hybrid",
+            )
             or log_proxy_corr_all
         )
         if correlation_analysis:
-            # Only compute importance when we will log correlation_scatter.csv.
-            compute_importance = compute_importance or (iteration % corr_log_interval == 0)
-        if compute_importance:
+            # Only compute vis_pixel_count when we will log correlation_scatter.csv.
+            compute_vis_pixel_count = compute_vis_pixel_count or (iteration % corr_log_interval == 0)
+        if compute_vis_pixel_count:
             max_id = render_pkg.get("max_id")
-            if max_id is not None and (iteration % importance_update_interval == 0):
+            if max_id is not None and (iteration % vis_pixel_count_update_interval == 0):
                 with torch.no_grad():
                     max_id_sub, scale = _subsample_max_id(
                         max_id,
-                        stride=getattr(args, "importance_subsample_stride", 1),
-                        ratio=getattr(args, "importance_subsample_ratio", 1.0),
+                        stride=getattr(args, "vis_pixel_count_subsample_stride", 1),
+                        ratio=getattr(args, "vis_pixel_count_subsample_ratio", 1.0),
                     )
                     valid = max_id_sub >= 0
-                    if args.importance_mode == "count":
+                    if args.vis_pixel_count_mode == "count":
                         if valid.any():
                             counts = torch.bincount(
                                 max_id_sub[valid].view(-1),
@@ -286,12 +293,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             ).float() * scale
                         else:
                             counts = torch.zeros((gaussians.get_xyz.shape[0],), device="cuda")
-                        gaussians.update_importance(counts, ema=args.importance_ema)
-                    elif args.importance_mode == "wsum":
-                        raise AssertionError("importance_mode=wsum is not supported without max_weight from renderer")
+                        gaussians.update_vis_pixel_count(counts, ema=args.vis_pixel_count_ema)
+                    elif args.vis_pixel_count_mode == "wsum":
+                        raise AssertionError("vis_pixel_count_mode=wsum is not supported without max_weight from renderer")
                     else:
-                        raise AssertionError("Unknown importance_mode: {}".format(args.importance_mode))
-        if args.reloc_sampling == "importance_snapshot":
+                        raise AssertionError("Unknown vis_pixel_count_mode: {}".format(args.vis_pixel_count_mode))
+        if args.reloc_sampling == "vis_pixel_count_snapshot":
             if (iteration < opt.densify_until_iter
                     and iteration > opt.densify_from_iter
                     and iteration % opt.densification_interval == 0):
@@ -306,14 +313,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             ).float()
                         else:
                             counts = torch.zeros((gaussians.get_xyz.shape[0],), device="cuda")
-                        gaussians.update_importance_snapshot(
+                        gaussians.update_vis_pixel_count_snapshot(
                             counts,
-                            top_frac=args.importance_snapshot_top_frac
+                            top_frac=args.vis_pixel_count_snapshot_top_frac
                         )
                 else:
-                    gaussians.clear_importance_snapshot()
+                    gaussians.clear_vis_pixel_count_snapshot()
             else:
-                gaussians.clear_importance_snapshot()
+                gaussians.clear_vis_pixel_count_snapshot()
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
@@ -341,7 +348,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if args.reloc_sampling == "error" or log_proxy_corr_all or correlation_analysis:
             if gaussians._opacity.grad is not None:
                 with torch.no_grad():
-                    gaussians.update_error_importance(
+                    gaussians.update_error_score(
                         gaussians._opacity.grad.detach().abs().squeeze(-1),
                         ema=args.error_ema
                     )
@@ -443,7 +450,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 num_gaussians_dead = num_gaussians_total_current - num_gaussians_alive
                 alive_ratio_percent = 100.0 * (num_gaussians_alive / max(1, num_gaussians_total_current))
 
-                # Visibility / importance proxies from renderer
+                # Visibility / vis_pixel_count proxies from renderer
                 is_used = render_pkg.get("is_used", None)
                 visibility_filter = render_pkg.get("visibility_filter", None)
                 num_max_contributor_gaussians = 0
@@ -462,27 +469,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if diagnostic_logging:
                     if args.reloc_sampling == "random":
                         proxy_name = "random"
-                    elif args.reloc_sampling == "visibility":
-                        proxy_vals = gaussians.visibility_score
-                        proxy_name = "visibility"
+                    elif args.reloc_sampling == "vis_binary":
+                        proxy_vals = gaussians.vis_binary_score
+                        proxy_name = "vis_binary"
                     elif args.reloc_sampling == "opacity":
                         proxy_vals = opacity_vals
                         proxy_name = "opacity"
-                    elif args.reloc_sampling == "importance":
-                        proxy_vals = gaussians.importance_score
-                        proxy_name = "importance"
-                    elif args.reloc_sampling == "importance_snapshot":
-                        proxy_vals = gaussians.importance_snapshot_score
-                        proxy_name = "importance_snapshot"
-                    elif args.reloc_sampling == "importance_ema_quantile":
-                        proxy_vals = gaussians.get_importance_ema_quantile()
-                        proxy_name = "importance_ema_quantile"
+                    elif args.reloc_sampling == "vis_pixel_count":
+                        proxy_vals = gaussians.vis_pixel_count_score
+                        proxy_name = "vis_pixel_count"
+                    elif args.reloc_sampling == "vis_pixel_count_snapshot":
+                        proxy_vals = gaussians.vis_pixel_count_snapshot_score
+                        proxy_name = "vis_pixel_count_snapshot"
+                    elif args.reloc_sampling == "vis_pixel_count_ema_quantile":
+                        proxy_vals = gaussians.get_vis_pixel_count_ema_quantile()
+                        proxy_name = "vis_pixel_count_ema_quantile"
                     elif args.reloc_sampling == "error":
                         proxy_vals = gaussians.error_score
                         proxy_name = "error"
-                    elif args.reloc_sampling == "hybrid":
-                        proxy_vals = opacity_vals * gaussians.importance_score
-                        proxy_name = "hybrid"
+                    elif args.reloc_sampling == "vis_pixel_count_hybrid":
+                        proxy_vals = opacity_vals * gaussians.vis_pixel_count_score
+                        proxy_name = "vis_pixel_count_hybrid"
                     if proxy_vals is not None and proxy_vals.numel() == opacity_vals.numel():
                         proxy_stats = train_logging.proxy_stats(proxy_vals, opacity_vals)
                 if analysis_logging and log_proxy_corr_all:
@@ -507,7 +514,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     "pop/num_alive": num_gaussians_alive,
                     "pop/num_dead": num_gaussians_dead,
                     "pop/alive_ratio_percent": float(alive_ratio_percent),
-                    # Visibility & importance (limited by available renderer outputs)
+                    # Visibility & vis_pixel_count (limited by available renderer outputs)
                     "vis/mean_blending_weight": float(mean_blending_weight),
                     "vis/num_max_contributor": num_max_contributor_gaussians,
                     "vis/num_visible": num_visible_gaussians,
@@ -533,8 +540,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if correlation_analysis and (iteration % corr_log_interval == 0):
                     corr_sources = {
                         "opacity": opacity_vals,
-                        "importance": gaussians.importance_score,
-                        "visibility": gaussians.visibility_score,
+                        "vis_pixel_count": gaussians.vis_pixel_count_score,
+                        "vis_binary": gaussians.vis_binary_score,
                     }
                     for a_name, a_vals in corr_sources.items():
                         for b_name, b_vals in corr_sources.items():
@@ -551,33 +558,33 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             if correlation_analysis and (iteration % corr_log_interval == 0):
                 with torch.no_grad():
-                    raw_visibility = None
+                    raw_vis_binary = None
                     if visibility_filter is not None and visibility_filter.numel() == gaussians.get_xyz.shape[0]:
-                        raw_visibility = visibility_filter.float()
-                    raw_importance = None
+                        raw_vis_binary = visibility_filter.float()
+                    raw_vis_pixel_count = None
                     max_id = render_pkg.get("max_id")
                     if max_id is not None:
                         max_id_sub, scale = _subsample_max_id(
                             max_id,
-                            stride=getattr(args, "importance_subsample_stride", 1),
-                            ratio=getattr(args, "importance_subsample_ratio", 1.0),
+                            stride=getattr(args, "vis_pixel_count_subsample_stride", 1),
+                            ratio=getattr(args, "vis_pixel_count_subsample_ratio", 1.0),
                         )
                         valid = max_id_sub >= 0
                         if valid.any():
-                            raw_importance = torch.bincount(
+                            raw_vis_pixel_count = torch.bincount(
                                 max_id_sub[valid].view(-1),
                                 minlength=gaussians.get_xyz.shape[0],
                             ).float() * scale
                         else:
-                            raw_importance = torch.zeros(
+                            raw_vis_pixel_count = torch.zeros(
                                 (gaussians.get_xyz.shape[0],), device="cuda"
                             )
                     corr_scatter_path = train_logging.append_corr_scatter_rows(
                         corr_scatter_path,
                         iteration,
                         gaussians,
-                        raw_visibility=raw_visibility,
-                        raw_importance=raw_importance,
+                        raw_vis_binary=raw_vis_binary,
+                        raw_vis_pixel_count=raw_vis_pixel_count,
                         sample_frac=0.01,
                     )
 
@@ -622,8 +629,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 dead_mask = (gaussians.get_opacity <= 0.005).squeeze(-1)
                 reloc_info = gaussians.relocate_gs(dead_mask=dead_mask)
                 add_info = gaussians.add_new_gs(cap_max=args.cap_max)
-                if args.reloc_sampling == "importance_snapshot":
-                    gaussians.clear_importance_snapshot()
+                if args.reloc_sampling == "vis_pixel_count_snapshot":
+                    gaussians.clear_vis_pixel_count_snapshot()
                 if prev_photometric_loss is not None:
                     pending_reloc_prev_loss = float(prev_photometric_loss)
                     pending_reloc_iter = iteration

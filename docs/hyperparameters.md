@@ -1,86 +1,114 @@
-# Hyperparameters and CLI options
+# Hyperparameters and CLI options (current code)
 
-This project exposes training, rendering, and evaluation settings through CLI flags and (optionally) JSON config files. Defaults listed below are the in-code defaults.
+This file mirrors the current defaults in `arguments/__init__.py`, `train.py`, and `render.py`.
 
-## Configuration precedence
+## Configuration precedence (`train.py`)
 
-Training (`train.py`) supports `--config` (JSON). Any CLI flag you provide overrides the config value; otherwise the config value replaces the default.
+1. Parser defaults are loaded first.
+2. If `--config path.json` is set, JSON keys overwrite defaults for keys not explicitly passed on CLI.
+3. Explicit CLI flags always win.
 
-Rendering (`render.py`) reads `cfg_args` from the `--model_path` directory (written during training) and then applies CLI overrides.
+Special case: if `test_iterations` is not set in CLI or config, it is auto-filled as `0, 5000, 10000, ... , iterations`.
 
-## Loading / model parameters (ModelParams)
+## Model parameters (`ModelParams`)
 
-| Flag | Type / options | Default | What it does |
-| --- | --- | --- | --- |
-| `--sh_degree` | int | `3` | Max spherical harmonics degree (increases over time during training). |
-| `--source_path`, `-s` | path | `""` | Dataset root path. |
-| `--model_path`, `-m` | path | `""` | Output folder for checkpoints and logs. |
-| `--images`, `-i` | str | `"images"` | Subfolder name containing input images. |
-| `--resolution`, `-r` | int | `-1` | Image resolution; `-1` keeps dataset resolution. |
-| `--white_background`, `-w` | bool | `False` | Use white background instead of black. |
-| `--data_device` | str | `"cuda"` | Device for dataset tensors (e.g., `cuda`, `cpu`). |
-| `--eval` | bool | `False` | Load dataset in evaluation mode (e.g., LLFF holdout). |
-| `--cap_max` | int | `-1` | Max number of Gaussians; required by this repo (see README). |
-| `--init_type` | str | `"random"` | Initialization mode: `random` or `sfm`. |
+| Flag | Default | Notes |
+| --- | --- | --- |
+| `--sh_degree` | `3` | Max SH degree. |
+| `--source_path`, `-s` | `""` | Dataset root. |
+| `--model_path`, `-m` | `""` | Output directory. |
+| `--images`, `-i` | `"images"` | Image subfolder name. |
+| `--resolution`, `-r` | `-1` | `-1` keeps original resolution. |
+| `--white_background`, `-w` | `False` | Use white background. |
+| `--data_device` | `"cuda"` | Tensor device for data. |
+| `--eval` | `False` | Dataset eval mode. |
+| `--cap_max` | `-1` | Max Gaussian count; required by this repo at runtime. |
+| `--init_type` | `"random"` | Dataset init mode (`random`, `sfm`, dataset-dependent extras). |
 
-## Pipeline parameters (PipelineParams)
+## Pipeline parameters (`PipelineParams`)
 
-| Flag | Type / options | Default | What it does |
-| --- | --- | --- | --- |
-| `--convert_SHs_python` | bool | `False` | Use Python SH conversion instead of CUDA. |
-| `--compute_cov3D_python` | bool | `False` | Use Python 3D covariance instead of CUDA. |
-| `--debug` | bool | `False` | Enable pipeline debug in render loop. |
+| Flag | Default | Notes |
+| --- | --- | --- |
+| `--convert_SHs_python` | `False` | Python SH conversion instead of CUDA path. |
+| `--compute_cov3D_python` | `False` | Python covariance path. |
+| `--debug` | `False` | Internal render debug flag. |
 
-## Optimization parameters (OptimizationParams)
+## Optimization parameters (`OptimizationParams`)
 
-| Flag | Type / options | Default | What it does |
-| --- | --- | --- | --- |
-| `--iterations` | int | `30000` | Total training iterations. |
-| `--position_lr_init` | float | `0.00016` | Initial position learning rate. |
-| `--position_lr_final` | float | `0.0000016` | Final position learning rate. |
-| `--position_lr_delay_mult` | float | `0.01` | Delay multiplier for position LR warmup. |
-| `--position_lr_max_steps` | int | `30000` | Steps for position LR schedule. |
-| `--feature_lr` | float | `0.0025` | Feature learning rate. |
-| `--opacity_lr` | float | `0.05` | Opacity learning rate. |
-| `--scaling_lr` | float | `0.005` | Scaling learning rate. |
-| `--rotation_lr` | float | `0.001` | Rotation learning rate. |
-| `--percent_dense` | float | `0.01` | Percent of densified points per interval. |
-| `--lambda_dssim` | float | `0.2` | DSSIM weight in photometric loss. |
-| `--densification_interval` | int | `100` | Iterations between densification checks. |
-| `--opacity_reset_interval` | int | `3000` | Iterations between opacity resets. |
-| `--densify_from_iter` | int | `500` | Start densification at this iteration. |
-| `--densify_until_iter` | int | `25000` | Stop densification at this iteration. |
-| `--densify_grad_threshold` | float | `0.0002` | Gradient threshold to trigger densification. |
-| `--random_background` | bool | `False` | Use random background colors during training. |
-| `--noise_lr` | float | `5e5` | Noise injection scale for relocation. |
-| `--scale_reg` | float | `0.01` | Scaling regularizer weight. |
-| `--opacity_reg` | float | `0.01` | Opacity regularizer weight. |
-| `--reloc_sampling` | str | `"opacity"` | Relocation sampling strategy: `opacity`, `random`, `importance`, `error`, `hybrid`, `vis_opacity`, `vis_importance`, `vis_hybrid`. |
-| `--importance_ema` | float | `0.9` | EMA for importance proxy updates. |
-| `--error_ema` | float | `0.9` | EMA for error proxy updates. |
-| `--visibility_ema` | float | `0.9` | EMA for visibility proxy updates. |
-| `--importance_mode` | str | `"count"` | Importance proxy mode: `count` (supported), `wsum` (not supported). |
-| `--log_proxy_corr_all` | bool | `False` | Log proxy correlation metrics each interval. |
-| `--psnr_threshold` | float | `-1.0` | PSNR target used to log time-to-threshold; set `-1` to disable. |
+| Flag | Default | Notes |
+| --- | --- | --- |
+| `--iterations` | `30000` | Total train iterations. |
+| `--position_lr_init` | `0.00016` | XYZ LR schedule start. |
+| `--position_lr_final` | `0.0000016` | XYZ LR schedule end. |
+| `--position_lr_delay_mult` | `0.01` | XYZ LR delay multiplier. |
+| `--position_lr_max_steps` | `30000` | XYZ LR schedule length. |
+| `--feature_lr` | `0.0025` | Feature LR. |
+| `--opacity_lr` | `0.05` | Opacity LR. |
+| `--scaling_lr` | `0.005` | Scale LR. |
+| `--rotation_lr` | `0.001` | Rotation LR. |
+| `--percent_dense` | `0.01` | Densification ratio parameter. |
+| `--lambda_dssim` | `0.2` | SSIM mixing term in photometric loss. |
+| `--densification_interval` | `100` | Densification cadence. |
+| `--opacity_reset_interval` | `3000` | Opacity reset cadence. |
+| `--densify_from_iter` | `500` | Densification start iteration. |
+| `--densify_until_iter` | `25000` | Densification stop iteration. |
+| `--densify_grad_threshold` | `0.0002` | Densification gradient threshold. |
+| `--random_background` | `False` | Random background per iteration. |
+| `--noise_lr` | `500000.0` | Noise multiplier term. |
+| `--noise_guidance` | `"opacity"` | Supported: `opacity`, `error`, `opacity_error_percentile`, `opacity_error_threshold`, `random`. |
+| `--noise_amplification` | `1.0` | Extra multiplier on noise scale. |
+| `--noise_error_percentile_threshold` | `0.0` | Percentile threshold for percentile guidance modes. |
+| `--noise_error_absolute_threshold` | `0.005` | Absolute threshold for threshold guidance modes. |
+| `--noise_error_moving_average_window_size` | `100` | Window for moving-average error guidance. |
+| `--noise_error_avg_mode` | `"windowed_moving_average"` | `windowed_moving_average`, `ema`, `none`. |
+| `--noise_error_ema_decay` | `0.9` | EMA decay when `noise_error_avg_mode=ema`. |
+| `--noise_error_downscale` | `1` | Error-guidance render downscale factor. |
+| `--per_pixel_error_metric` | `"l1"` | Per-pixel error metric (`l1` or `psnr` path). |
+| `--per_pixel_patch_size` | `1` | Patch size for local error smoothing. |
+| `--scale_reg` | `0.01` | Scale regularization weight. |
+| `--opacity_reg` | `0.01` | Opacity regularization weight. |
+| `--reloc_sampling` | `"opacity"` | Supported: `random`, `opacity`, `vis_binary`, `vis_pixel_count`, `vis_pixel_count_snapshot`, `vis_pixel_count_ema_quantile`, `error`, `vis_pixel_count_hybrid`, `vis_binary_opacity`, `vis_binary_vis_pixel_count`, `vis_binary_vis_pixel_count_hybrid`. |
+| `--vis_pixel_count_ema` | `0.9` | EMA decay for vis-pixel-count proxy. |
+| `--error_ema` | `0.9` | EMA decay for error proxy. |
+| `--vis_binary_ema` | `0.9` | EMA decay for binary-visibility proxy. |
+| `--vis_pixel_count_mode` | `"count"` | `count` supported (`wsum` currently raises). |
+| `--vis_pixel_count_snapshot_top_frac` | `0.01` | Top fraction kept for snapshot proxy. |
+| `--vis_pixel_count_ema_quantile_top_frac` | `0.01` | Top fraction kept for EMA-quantile proxy. |
+| `--vis_pixel_count_update_interval` | `1` | Update cadence for vis-pixel-count proxy. |
+| `--vis_pixel_count_subsample_stride` | `1` | Spatial stride before counting max-contributor IDs. |
+| `--vis_pixel_count_subsample_ratio` | `1.0` | Random ratio after stride subsampling. |
+| `--log_proxy_corr_all` | `False` | Log full proxy correlation set. |
+| `--correlation_analysis` | `False` | Enables correlation CSV + extra correlation logs. |
+| `--cleanup_random_ply` | `True` | Remove generated random init PLY after training. |
+| `--psnr_threshold` | `23.46` | Logs time-to-threshold when test PSNR crosses this. |
 
-## Training runtime parameters (train.py)
+## Train runtime flags (`train.py`)
 
-| Flag | Type / options | Default | What it does |
-| --- | --- | --- | --- |
-| `--config` | path | `None` | Optional JSON config file. |
-| `--debug_from` | int | `-1` | Enable render pipeline debug from this iteration. |
-| `--detect_anomaly` | bool | `False` | Enable autograd anomaly detection. |
-| `--test_iterations` | list[int] | `7000 30000` | Iterations to run evaluation renders. |
-| `--save_iterations` | list[int] | `7000 30000` | Iterations to save checkpoints; final iteration is appended. |
-| `--checkpoint_iterations` | list[int] | `[]` | Iterations to write extra checkpoints. |
-| `--start_checkpoint` | path | `None` | Restore from checkpoint. |
-| `--quiet` | bool | `False` | Reduce console output. |
+| Flag | Default | Notes |
+| --- | --- | --- |
+| `--config` | `None` | JSON config file path. |
+| `--debug_from` | `-1` | Turns on pipeline debug at/after this iteration. |
+| `--detect_anomaly` | `False` | PyTorch anomaly detection. |
+| `--test_iterations` | parser: `[7000, 30000]` | Effective default is auto-generated schedule described above. |
+| `--save_iterations` | `[7000, 30000]` | `iterations` is always appended at runtime. |
+| `--quiet` | `False` | Reduce console noise. |
+| `--checkpoint_iterations` | `[]` | Extra checkpoint saves. |
+| `--start_checkpoint` | `None` | Resume checkpoint path. |
+| `--wandb_project` | `None` | Override W&B project. |
+| `--wandb_run_name` | `None` | Override run name. |
+| `--wandb_run_group` | `None` | Optional W&B group. |
+| `--scene_id` | `None` | Optional run metadata. |
+| `--scene_type` | `None` | Optional run metadata. |
+| `--mlflow` | `False` | Explicit MLflow enable (W&B path can also enable MLflow). |
+| `--logging_level` | `"core"` | `core`, `diagnostic`, `analysis`. |
 
-## Rendering parameters (render.py)
+## Render flags (`render.py`)
 
-| Flag | Type / options | Default | What it does |
-| --- | --- | --- | --- |
-| `--iteration` | int | `-1` | Which training iteration to render (`-1` = latest). |
-| `--skip_train` | bool | `False` | Skip train split rendering. |
-| `--skip_test` | bool | `False` | Skip test split rendering. |
-| `--quiet` | bool | `False` | Reduce console output. |
+`render.py` also accepts `ModelParams` + `PipelineParams` flags above.
+
+| Flag | Default | Notes |
+| --- | --- | --- |
+| `--iteration` | `-1` | `-1` loads latest available iteration. |
+| `--skip_train` | `False` | Skip rendering train split. |
+| `--skip_test` | `False` | Skip rendering test split. |
+| `--quiet` | `False` | Reduce console output. |

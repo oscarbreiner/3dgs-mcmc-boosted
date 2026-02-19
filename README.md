@@ -75,8 +75,19 @@ CUDA_HOME=PATH/TO/CONDA/envs/3dgs-mcmc-env/pkgs/cuda-toolkit/ \
 Rasterizer fork used in this project:
 - https://github.com/oscarbreiner/diff-gaussian-rasterization.git
 
-### Common issue: diff-gaussian-rasterization compile flags
-If building fails due to compiler/symbol issues, you may need to adjust `extra_compile_args` in the rasterizer `setup.py` (see gaussian-splatting issue #41), then reinstall the submodule.
+### Common Issues
+1. Access error during cloning:
+If cloning via SSH fails, verify your SSH key setup and repository access. As an alternative, clone via HTTPS.
+
+2. `diff-gaussian-rasterization` build fails:
+If compilation fails (often due to compiler/symbol settings), update `extra_compile_args` in the rasterizer `setup.py`:
+
+```sh
+extra_compile_args={"nvcc": ["-Xcompiler", "-fno-gnu-unique", "-I" + os.path.join(os.path.dirname(os.path.abspath(__file__)), "third_party/glm/")]}
+```
+
+Then reinstall `diff-gaussian-rasterization`.
+Reference: https://github.com/graphdeco-inria/gaussian-splatting/issues/41
 
 ---
 
